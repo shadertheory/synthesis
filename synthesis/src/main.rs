@@ -1,56 +1,93 @@
-use std::sync::atomic::{Ordering, *};
+use bytemuck::*;
+use std::collections::BTreeMap;
+use std::marker::PhantomData;
 use std::mem;
 use std::slice;
-use bytemuck::*;
+use std::sync::atomic::{Ordering::*, *};
 
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
 pub struct Entity {
     identity: usize,
     generation: usize,
 }
 
-static ENTITY_COUNT: AtomicUsize = AtomicUsize::new();
+static ENTITY_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 impl Entity {
     fn next() -> Entity {
         let identity = ENTITY_COUNT.fetch_add(1, Acquire);
         let generation = 0;
 
-        Entity { identity, generation }
+        Entity {
+            identity,
+            generation,
+        }
     }
 
     fn refresh(self) -> Entity {
-        let Entity { identity, mut generation } = self;
+        let Entity {
+            identity,
+            mut generation,
+        } = self;
         generation += 1;
 
-        Entity { identity, generation }
+        Entity {
+            identity,
+            generation,
+        }
     }
 }
 
 pub struct Type(u128);
 
-pub struct Archetype(Vec<Type>);
+pub struct Archetype(Array<Type>);
 
 pub trait Component {}
 
-pub const CELL_SIZE: usize = 128;
-pub enum Cell {
-    ([u8; CELL_SIZE]),
-    (Vec<u8>)
-}
-
-
 pub type Column = usize;
 
-pub struct SparseSet<K: Ord, V: AnyBitPattern> {
+pub enum Array<T, const CAP: usize = 16> {
+    Inline([T; CAP]),
+    Spill(Vec<T>),
+}
+
+impl<T, const CAP: usize> AsRef<[T]> for Array<T, CAP> {
+    fn as_ref(&self) -> &[T] {
+        match self {
+            Self::Inline(arr) => arr.as_ref(),
+            Self::Spill(vec) => vec.as_ref(),
+        }
+    }
+}
+
+pub trait BitPattern: Sized {
+    fn to_bytes(self) -> Vec<u8>;
+    fn from_bytes(bytes: &[u8]) -> Self;
+}
+
+impl<T: AsRef<[u8]>> BitPattern for T {
+    fn to_bytes(self) -> Vec<u8> {}
+    fn from_bytes(bytes: &[u8]) -> Self {}
+}
+
+pub struct MultiMap<K, V>(BTreeMap<K, Vec<V>>);
+
+// Layer 2: Symmetric/bidirectional multimap (inverse is materialized)
+pub struct SymMap<L, R> {
+    forward: MultiMap<L, R>,
+    reverse: MultiMap<R, L>,
+}
+
+pub struct SparseMap<K: Ord, V: BitPattern> {
     //Sorted list of key's and their value's column index
     indices: Vec<(K, Column)>,
     //Bit representation of all values represented contiguously
     data: Vec<u8>,
-
+    value: PhantomData<[(K, V)]>,
 }
 
-impl<K: Ord, V: AnyBitPattern> SparseSet<K, V> {
-    pub fn new() -> SparseSet<K, V> {
+impl<K: Ord, V: BitPattern> SparseMap<K, V> {
+    pub fn new() -> SparseMap<K, V> {
         Default::default()
     }
 
@@ -64,9 +101,7 @@ impl<K: Ord, V: AnyBitPattern> SparseSet<K, V> {
         self.indices.push((key, next_column));
         //SAFETY: value is in scope during and to the end of this function,
         //thus casting it directly to bytes is guarenteed to be valid data.
-        self.data.extend(unsafe {
-            slice::from_raw_parts(&value as *const _ as *const u8, value_size)
-        })
+        self.data.extend(value.to_bytes())
     }
 
     pub fn remove(&mut self, key: &K) {
@@ -83,16 +118,29 @@ impl<K: Ord, V: AnyBitPattern> SparseSet<K, V> {
     }
 }
 
-impl<K: Ord, V: AnyBitPattern> Default for SparseSet<K, V> {
+impl<K: Ord, V: BitPattern> Default for SparseMap<K, V> {
     fn default() -> Self {
         Self {
             indices: vec![],
-            data: vec![]
+            data: vec![],
+            value: PhantomData,
         }
     }
 }
 
+pub type Identity = usize;
 
-fn main() {
-    println!("Hello, world!");
+pub struct Scene {
+    data: BTreeMap<Identity, SparseMap<Entity, Array<u8>>>,
+    entities: SymMap<Archetype, Entity>,
 }
+
+impl Default for Scene {
+    fn default() -> Self {
+        Self {
+            data: BTreeMap::default(),
+        }
+    }
+}
+
+fn main() {}
