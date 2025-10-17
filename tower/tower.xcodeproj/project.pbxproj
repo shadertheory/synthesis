@@ -62,11 +62,22 @@
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
+/* Begin PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet section */
+		D68CDCE92EA2E9350082C423 /* Exceptions for "iOS" folder in "Compile Sources" phase from "iOS" target */ = {
+			isa = PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet;
+			buildPhase = D6D49F962E9D757100C2FF20 /* Sources */;
+			membershipExceptions = (
+				"/Localized: Main.storyboard",
+			);
+		};
+/* End PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		D6D49F9B2E9D757100C2FF20 /* iOS */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
 				D6D49FCC2E9D758600C2FF20 /* Exceptions for "iOS" folder in "iOS" target */,
+				D68CDCE92EA2E9350082C423 /* Exceptions for "iOS" folder in "Compile Sources" phase from "iOS" target */,
 			);
 			path = iOS;
 			sourceTree = "<group>";

@@ -6,12 +6,12 @@
 //
 
 #import <UIKit/UIKit.h>
-#import "engine.h"
+#import "delegate.h"
 
 int main(int argc, char * argv[]) {
-    engine_start();
-    
-    while(true) {
-        engine_draw();
+    NSString * appDelegateClassName;
+    @autoreleasepool {
+        appDelegateClassName = NSStringFromClass([AppDelegate class]);
     }
+    return UIApplicationMain(argc, argv, nil, appDelegateClassName);
 }

@@ -9,7 +9,7 @@ use std::{
 };
 
 #[thread_local]
-pub static INSTANCE: RefCell<Option<Platform>> = RefCell::new(None);
+pub static mut INSTANCE: Option<Platform> = None;
 
 type Inline<T, const CAP: usize> = [MaybeUninit<T>; CAP];
 pub enum Array<T, const CAP: usize = 16> {
@@ -67,13 +67,18 @@ pub trait Physics: World {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn engine_start() {
-    INSTANCE.replace(Some(unsafe { Platform::init() }));
+pub extern "C" fn engine_start(data: *const ()) {
+    unsafe {
+        INSTANCE = Some(Platform::init(data));
+    };
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn engine_draw() {
-    INSTANCE.try_borrow().unwrap().as_ref().unwrap().draw();
+    unsafe {
+        #[allow(static_mut_refs)]
+        INSTANCE.as_mut().unwrap().draw();
+    }
 }
 
 pub trait Field {}
@@ -110,7 +115,6 @@ pub mod darwin {
     // iOS implementation using UIView + CAMetalLayer
     #[cfg(target_os = "ios")]
     pub struct Surface {
-        view_controller: Retained<UIViewController>,
         screen: Retained<UIScreen>,
         drawable: Option<Retained<ProtocolObject<dyn PlatformDrawable>>>,
         metal_view: Retained<UIView>,
@@ -121,45 +125,47 @@ pub mod darwin {
 
     #[cfg(target_os = "ios")]
     impl Surface {
-        pub unsafe fn new() -> Surface {
-            let view_controller: Retained<UIViewController> =
-                msg_send_id![objc2::class!(UIViewController), new];
+        /// Get UIScreen from UIWindowScene
+        pub fn main_screen(app: &UIApplication) -> Retained<UIScreen> {
+            app.windows().firstObject().unwrap().screen()
+        }
+
+        pub unsafe fn new(view_controller: &UIViewController) -> Surface {
+            let app = UIApplication::sharedApplication(MainThreadMarker::new().unwrap());
 
             // Get main screen bounds
-            let screen: Retained<UIScreen> = msg_send_id![objc2::class!(UIScreen), mainScreen];
+            let screen: Retained<UIScreen> = Self::main_screen(&app);
             let bounds: NSRect = msg_send![&*screen, bounds];
-
-            // Create Metal device
-            let metal_device = MTLCreateSystemDefaultDevice().expect("Failed to get metal device.");
+            println!("Got screen with bounds {:?}", bounds);
 
             // Create UIView
-            let metal_view: Retained<UIView> = msg_send_id![
-                msg_send_id![UIView::class(), alloc],
-                initWithFrame: bounds
-            ];
+            let metal_view: Retained<UIView> =
+                UIView::init(UIView::alloc(MainThreadMarker::new().unwrap()));
+            println!("Got screen with bounds {:?}", bounds);
 
             // Create CAMetalLayer
-            let metal_layer: Retained<CAMetalLayer> = msg_send_id![CAMetalLayer::class(), new];
+            let metal_layer: Retained<CAMetalLayer> = CAMetalLayer::init(CAMetalLayer::alloc());
+            let metal_device = metal_layer.device().expect("could not get device");
+            println!("Got screen with bounds {:?}", bounds);
 
             // Configure the layer
-            let _: () = msg_send![&*metal_layer, setDevice: &*metal_device];
             let _: () =
                 msg_send![&*metal_layer, setPixelFormat: objc2_metal::MTLPixelFormat::BGRA8Unorm];
             let _: () = msg_send![&*metal_layer, setFramebufferOnly: false];
 
             // Set the layer's frame to match the view bounds
             let _: () = msg_send![&*metal_layer, setFrame: bounds];
+            println!("Got screen with bounds {:?}", bounds);
 
             // Get the view's layer and add metal layer as sublayer
-            let view_layer: Retained<CALayer> = msg_send_id![&*metal_view, layer];
-            let _: () = msg_send![&*view_layer, addSublayer: &*metal_layer];
+            metal_view.layer().addSublayer(&metal_layer);
 
             // Set view on view controller
-            let _: () = msg_send![&*view_controller, setView: &*metal_view];
+            view_controller.setView(Some(&metal_view));
+            println!("Got screen with bounds {:?}", bounds);
 
             let mut surface = Self {
                 drawable: None,
-                view_controller,
                 screen,
                 metal_view,
                 metal_layer,
@@ -167,11 +173,9 @@ pub mod darwin {
                 bounds,
             };
 
-            // Set initial scale
-            surface.set_scale();
-
             surface
         }
+
         fn device(&self) -> Retained<ProtocolObject<dyn MTLDevice>> {
             self.metal_device.clone()
         }
@@ -192,7 +196,7 @@ pub mod darwin {
         }
         pub unsafe fn next(&mut self) -> (Retained<ProtocolObject<dyn MTLTexture>>, Size) {
             let drawable: Option<Retained<ProtocolObject<dyn PlatformDrawable>>> =
-                msg_send![&self.metal_layer, nextDrawable];
+                self.metal_layer.nextDrawable();
             let Some(texture) = drawable.as_ref().map(|x| x.texture()) else {
                 panic!("could not get next texture to present.");
             };
@@ -212,19 +216,22 @@ pub mod darwin {
             };
             let _: () = msg_send![&metal.command_queue, waitForDrawable:&*drawable];
 
-            metal
-                .command_queue
-                .commit_count(NonNull::from_ref(&NonNull::from_ref(&*commands).cast()), 1);
+            let cmd_ptr = NonNull::from(&*commands);
+            let mut cmd_array = [cmd_ptr];
+            let cmd_array_ptr = NonNull::new_unchecked(cmd_array.as_mut_ptr());
 
+            metal.command_queue.commit_count(cmd_array_ptr, 1);
             let _: () = msg_send![&metal.command_queue, signalDrawable:&*drawable];
 
-            let _: () = msg_send![&*drawable, present];
+            drawable.present();
+
+            self.drawable = Some(drawable);
         }
     }
 
     #[cfg(target_os = "macos")]
     pub struct Surface {
-        view_controller: Retained<UIViewController>,
+        view_controller: UIViewController,
         screen: Retained<UIScreen>,
         metal_view: Retained<MTKView>,
         metal_device: Retained<ProtocolObject<dyn MTLDevice>>,
@@ -233,7 +240,7 @@ pub mod darwin {
     #[cfg(target_os = "macos")]
     impl Surface {
         pub unsafe fn new() -> Surface {
-            let view_controller: Retained<UIViewController> =
+            let view_controller: UIViewController =
                 msg_send_id![objc2::class!(UIViewController), new];
 
             // Get main screen bounds
@@ -282,8 +289,8 @@ pub mod darwin {
         surface: Surface,
     }
     impl Window {
-        pub unsafe fn new() -> Self {
-            let mut surface = Surface::new();
+        pub unsafe fn new(view_controller: &UIViewController) -> Self {
+            let mut surface = Surface::new(view_controller);
             surface.set_scale();
             Self { surface }
         }
@@ -305,12 +312,13 @@ pub mod darwin {
 
     pub struct Metal {
         frame: usize,
+        frame_in_flight: usize,
         next_texture: Box<dyn Fn() -> (MTLResourceID, Size)>,
         next_present:
             Option<Box<dyn Fn(&mut Metal, Retained<ProtocolObject<dyn MTL4CommandBuffer>>)>>,
         device: Retained<ProtocolObject<dyn MTLDevice>>,
         command_queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
-        command_allocator: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
+        command_allocator: Vec<Retained<ProtocolObject<dyn MTL4CommandAllocator>>>,
         library: Retained<ProtocolObject<dyn MTLLibrary>>,
         frame_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
         ui_raytrace: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -323,6 +331,8 @@ pub mod darwin {
             next_texture: Box<dyn Fn() -> (MTLResourceID, Size)>,
             next_present: Box<dyn Fn(&mut Metal, Retained<ProtocolObject<dyn MTL4CommandBuffer>>)>,
         ) -> Self {
+            let frame_in_flight = 3;
+
             let next_present = Some(next_present);
 
             if !device.supportsFamily(MTLGPUFamily::Metal4) {
@@ -330,9 +340,13 @@ pub mod darwin {
             }
 
             let command_queue = msg_send![&device, newMTL4CommandQueue];
-            let command_allocator = device
-                .newCommandAllocator()
-                .expect("failed to create command allocator");
+            let command_allocator = (0..frame_in_flight)
+                .map(|_| {
+                    device
+                        .newCommandAllocator()
+                        .expect("failed to create command allocator")
+                })
+                .collect();
 
             let source = include_str!("ui3d.msl");
 
@@ -365,6 +379,7 @@ pub mod darwin {
 
             Self {
                 frame: 0,
+                frame_in_flight,
                 next_texture,
                 next_present,
                 device,
@@ -378,25 +393,30 @@ pub mod darwin {
         }
 
         unsafe fn render(&mut self) {
-            if self.frame > 0 {
-                let _: bool = msg_send![&self.frame_event, waitUntilSignaledValue: self.frame - 1, timeoutMS: 0u64];
-            }
-
+            let frame_index = self.frame % self.frame_in_flight;
             self.frame += 1;
+
+            if self.frame > self.frame_in_flight {
+                let last_frame = (self.frame - 1) % self.frame_in_flight;
+                let _: bool = msg_send![&self.frame_event, waitUntilSignaledValue: last_frame, timeoutMS: 10u64];
+            }
 
             let command_buffer = self
                 .device
                 .newCommandBuffer()
                 .expect("failed to create command buffer");
-            command_buffer.beginCommandBufferWithAllocator(&self.command_allocator);
+            let frame_allocator = &self.command_allocator[frame_index];
+            frame_allocator.reset();
+            command_buffer.beginCommandBufferWithAllocator(frame_allocator);
             let (id, size) = (self.next_texture)();
+            self.argument_table.setTexture_atIndex(id, 0);
 
             let encoder = command_buffer
                 .computeCommandEncoder()
                 .expect("failed to make compute encoder");
 
             encoder.setComputePipelineState(&self.ui_raytrace);
-            self.argument_table.setTexture_atIndex(id, 0);
+
             encoder.setArgumentTable(Some(&self.argument_table));
             encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
@@ -430,6 +450,10 @@ pub mod darwin {
             let mut present = self.next_present.take();
             (present.as_mut().unwrap())(self, command_buffer);
             self.next_present = present;
+
+            let _: () =
+                msg_send![&*self.command_queue, signalEvent:&*self.frame_event, value:frame_index];
+
             println!("presenting!");
             thread::sleep(Duration::from_secs_f32(1.0 / 120.0));
         }
@@ -437,23 +461,25 @@ pub mod darwin {
 
     pub struct Darwin {
         metal: RefCell<Metal>,
+        window: Rc<RefCell<Window>>,
     }
 
     impl Darwin {
-        pub unsafe fn init() -> Self {
-            let window = Window::new();
+        pub unsafe fn init(data: *const ()) -> Self {
+            let view_controller = data.cast::<UIViewController>().as_ref().unwrap();
+            let window = Window::new(view_controller);
             let window = Rc::new(RefCell::new(window));
             let draw = window.clone();
             let present = window.clone();
+            println!("Preparing to init metal");
             let metal = Metal::init(
                 window.borrow_mut().device(),
                 Box::new(move || draw.borrow_mut().next()),
                 Box::new(move |metal, commands| present.borrow_mut().draw(metal, commands)),
             );
             let metal = RefCell::new(metal);
-            Self { metal }
+            Self { metal, window }
         }
-
         pub fn draw(&self) {
             unsafe { self.metal.borrow_mut().render() }
         }

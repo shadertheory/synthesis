@@ -133,6 +133,7 @@
 				INSTALL_MODE_FLAG = "";
 				INSTALL_OWNER = "";
 				PRODUCT_NAME = engine;
+				RUSTFLAGS = "-C link-arg=-lobjc -C link-arg=-framework -C link-arg=UIKit";
 				SKIP_INSTALL = YES;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
@@ -150,6 +151,7 @@
 				INSTALL_MODE_FLAG = "";
 				INSTALL_OWNER = "";
 				PRODUCT_NAME = engine;
+				RUSTFLAGS = "-C link-arg=-lobjc -C link-arg=-framework -C link-arg=UIKit";
 				SKIP_INSTALL = YES;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
