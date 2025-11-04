@@ -171,7 +171,7 @@ pub mod darwin {
     use std::rc::Rc;
     use std::time::Duration;
     use std::{cell::RefCell, ptr::NonNull};
-    use std::{mem, thread};
+    use std::{mem, ptr, thread};
 
     use objc2::{rc::*, runtime::*, *};
     use objc2_core_graphics::*;
@@ -231,7 +231,6 @@ pub mod darwin {
             // Configure the layer
             let _: () =
                 msg_send![&*metal_layer, setPixelFormat: objc2_metal::MTLPixelFormat::BGRA8Unorm];
-            let _: () = msg_send![&*metal_layer, setFramebufferOnly: false];
 
             // Set the layer's frame to match the view bounds
             let _: () = msg_send![&*metal_layer, setFrame: bounds];
@@ -285,29 +284,31 @@ pub mod darwin {
             };
             let _: () = msg_send![&*self.metal_layer, setDrawableSize: drawable_size];
         }
-        pub unsafe fn next(&mut self) -> (Retained<ProtocolObject<dyn MTLTexture>>, Size) {
-            let drawable: Option<Retained<ProtocolObject<dyn PlatformDrawable>>> =
-                self.metal_layer.nextDrawable();
-            let Some(texture) = drawable.as_ref().map(|x| x.texture()) else {
-                panic!("could not get next texture to present.");
-            };
+        pub unsafe fn next(
+            &mut self,
+        ) -> (Retained<ProtocolObject<dyn MTLTexture + 'static>>, Size) {
+            let drawable: Retained<ProtocolObject<dyn PlatformDrawable>> =
+                self.metal_layer.nextDrawable().unwrap();
+
+            let texture = drawable.texture();
+
             println!("{:?}", texture);
-            self.drawable = drawable;
+            self.drawable = Some(drawable);
             let size = self.metal_layer.drawableSize();
             (texture, Size::new(size.width, size.height))
         }
 
-        pub unsafe fn draw(
-            &mut self,
-            metal: &mut Metal,
-            commands: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
-        ) {
+        pub unsafe fn draw(&mut self, metal: &mut Metal) {
+            let frame_index = metal.frame % metal.frame_in_flight;
+
+            #[allow(static_mut_refs)]
+            let commands = LATEST_CMDS.as_ref().expect("failed to get commands");
             let Some(drawable) = self.drawable.take() else {
                 panic!("No drawable available to present");
             };
             let _: () = msg_send![&metal.command_queue, waitForDrawable:&*drawable];
 
-            let cmd_ptr = NonNull::from(&*commands);
+            let cmd_ptr = NonNull::from(&**commands);
             let mut cmd_array = [cmd_ptr];
             let cmd_array_ptr = NonNull::new_unchecked(cmd_array.as_mut_ptr());
 
@@ -421,9 +422,9 @@ pub mod darwin {
         pub fn device(&self) -> Retained<ProtocolObject<dyn MTLDevice>> {
             self.surface.device()
         }
-        pub fn next(&mut self) -> (MTLResourceID, Size) {
+        pub fn next(&mut self) -> (Retained<ProtocolObject<dyn MTLTexture + 'static>>, Size) {
             let (texture, size) = unsafe { self.surface.next() };
-            (texture.gpuResourceID(), size)
+            (texture, size)
         }
         unsafe fn update_pan(&mut self) {
             let state: UIGestureRecognizerState = msg_send![&*self.pan, state];
@@ -469,12 +470,8 @@ pub mod darwin {
             self.poll_input();
             mem::take(&mut self.inputs)
         }
-        pub fn draw(
-            &mut self,
-            metal: &mut Metal,
-            commands: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
-        ) {
-            unsafe { self.surface.draw(metal, commands) }
+        pub fn draw(&mut self, metal: &mut Metal) {
+            unsafe { self.surface.draw(metal) }
         }
     }
     impl From<NSPoint> for crate::Vector<2, f32> {
@@ -482,27 +479,38 @@ pub mod darwin {
             Self([point.x as f32, point.y as f32])
         }
     }
+    static mut LATEST_CMDS: Option<Retained<ProtocolObject<dyn MTL4CommandBuffer + 'static>>> =
+        None;
     pub struct Metal {
         frame: usize,
         frame_in_flight: usize,
-        next_texture: Box<dyn Fn() -> (MTLResourceID, Size)>,
-        next_present:
-            Option<Box<dyn Fn(&mut Metal, Retained<ProtocolObject<dyn MTL4CommandBuffer>>)>>,
+        render_size: Size,
+        render_texture: Vec<Retained<ProtocolObject<dyn MTLTexture + 'static>>>,
+        next_texture: Box<dyn Fn() -> (Retained<ProtocolObject<dyn MTLTexture + 'static>>, Size)>,
+        next_present: Option<Box<dyn Fn(&mut Metal)>>,
         device: Retained<ProtocolObject<dyn MTLDevice>>,
+        residency_set: Retained<ProtocolObject<dyn MTLResidencySet>>,
         command_queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
         command_allocator: Vec<Retained<ProtocolObject<dyn MTL4CommandAllocator>>>,
+        instance_accel: Retained<ProtocolObject<dyn MTLAccelerationStructure>>,
         library: Retained<ProtocolObject<dyn MTLLibrary>>,
         frame_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
         ui_raytrace: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-        argument_table: Retained<ProtocolObject<dyn MTL4ArgumentTable>>,
-        camera_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+        argument_table: Vec<Retained<ProtocolObject<dyn MTL4ArgumentTable>>>,
+        argument_table2: Vec<Retained<ProtocolObject<dyn MTL4ArgumentTable>>>,
+        camera_buffer: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+        visible_function_table: Retained<ProtocolObject<dyn MTLVisibleFunctionTable>>,
+        upscale: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+        raytrace: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     }
 
     impl Metal {
         unsafe fn init(
             device: Retained<ProtocolObject<dyn MTLDevice>>,
-            next_texture: Box<dyn Fn() -> (MTLResourceID, Size)>,
-            next_present: Box<dyn Fn(&mut Metal, Retained<ProtocolObject<dyn MTL4CommandBuffer>>)>,
+            next_texture: Box<
+                dyn Fn() -> (Retained<ProtocolObject<dyn MTLTexture + 'static>>, Size),
+            >,
+            next_present: Box<dyn Fn(&mut Metal)>,
         ) -> Self {
             let frame_in_flight = 3;
 
@@ -512,14 +520,15 @@ pub mod darwin {
                 panic!("Metal 4 not supported.");
             }
 
-            let command_queue = msg_send![&device, newMTL4CommandQueue];
+            let command_queue: Retained<ProtocolObject<dyn MTL4CommandQueue>> =
+                msg_send![&device, newMTL4CommandQueue];
             let command_allocator = (0..frame_in_flight)
                 .map(|_| {
                     device
                         .newCommandAllocator()
                         .expect("failed to create command allocator")
                 })
-                .collect();
+                .collect::<Vec<_>>();
 
             let source = include_str!("ui3d.metal");
 
@@ -529,115 +538,455 @@ pub mod darwin {
                 .newLibraryWithSource_options_error(&source, None)
                 .expect("Failed to compile shader");
 
-            let func_name = NSString::from_str("reference_grid");
-            let function = library
-                .newFunctionWithName(&func_name)
-                .expect("Function not found");
+            let ui_raytrace = {
+                let func_name = NSString::from_str("reference_grid");
+                let function = library
+                    .newFunctionWithName(&func_name)
+                    .expect("Function not found");
+                device
+                    .newComputePipelineStateWithFunction_error(&function)
+                    .expect("Failed to create pipeline")
+            };
+            let upscale = {
+                let func_name = NSString::from_str("upscale_vert");
+                let vertex = library
+                    .newFunctionWithName(&func_name)
+                    .expect("Function not found");
 
-            let ui_raytrace = device
-                .newComputePipelineStateWithFunction_error(&function)
-                .expect("Failed to create pipeline");
+                let func_name = NSString::from_str("upscale_frag");
+                let fragment = library
+                    .newFunctionWithName(&func_name)
+                    .expect("Function not found");
 
+                let attachment = MTLRenderPipelineColorAttachmentDescriptor::init(
+                    MTLRenderPipelineColorAttachmentDescriptor::alloc(),
+                );
+
+                attachment.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+
+                let desc = MTLRenderPipelineDescriptor::init(MTLRenderPipelineDescriptor::alloc());
+                desc.setVertexFunction(Some(&vertex));
+                desc.setFragmentFunction(Some(&fragment));
+                desc.colorAttachments()
+                    .setObject_atIndexedSubscript(Some(&attachment), 0);
+                device
+                    .newRenderPipelineStateWithDescriptor_error(&desc)
+                    .expect("Failed to create pipeline")
+            };
+            let raytrace = {
+                let func_name = NSString::from_str("raytrace");
+                let rtx = library
+                    .newFunctionWithName(&func_name)
+                    .expect("Function not found");
+                let intersect_desc = MTLIntersectionFunctionDescriptor::init(
+                    MTLIntersectionFunctionDescriptor::alloc(),
+                );
+                intersect_desc.setName(Some(&NSString::from_str("sphere_intersect")));
+                let constant_values =
+                    MTLFunctionConstantValues::init(MTLFunctionConstantValues::alloc());
+                constant_values.setConstantValue_type_atIndex(
+                    NonNull::from_ref(&0u32).cast(),
+                    MTLDataType::UInt,
+                    1,
+                );
+                constant_values.setConstantValue_type_atIndex(
+                    NonNull::from_ref(&true).cast(),
+                    MTLDataType::Bool,
+                    1,
+                );
+                intersect_desc.setConstantValues(Some(&constant_values));
+                let intersect = library
+                    .newIntersectionFunctionWithDescriptor_error(&intersect_desc)
+                    .unwrap();
+                let linked = MTLLinkedFunctions::new();
+                linked.setFunctions(Some(&NSArray::from_slice(&[&*intersect])));
+                let mut desc =
+                    MTLComputePipelineDescriptor::init(MTLComputePipelineDescriptor::alloc());
+                desc.setComputeFunction(Some(&*rtx));
+                desc.setLinkedFunctions(Some(&*linked));
+                device
+                    .newComputePipelineStateWithDescriptor_options_reflection_error(
+                        &*desc,
+                        MTLPipelineOption::empty(),
+                        None,
+                    )
+                    .unwrap()
+            };
             let frame_event = device
                 .newSharedEvent()
                 .expect("Could not create shared event");
             let _: () = msg_send![&frame_event, setSignaledValue: 0u64];
 
-            let camera_buffer = device
+            let camera_buffer = (0..frame_in_flight)
+                .map(|_| {
+                    device
+                        .newBufferWithLength_options(512, MTLResourceOptions::StorageModeShared)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+
+            let render_size = Size::new(1280.0, 720.0);
+            let texture_descriptor = MTLTextureDescriptor::new();
+            texture_descriptor.setTextureType(MTLTextureType::Type2D);
+            texture_descriptor.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+            texture_descriptor.setWidth(render_size.width as usize);
+            texture_descriptor.setHeight(render_size.height as usize);
+            texture_descriptor.setHazardTrackingMode(MTLHazardTrackingMode::Tracked);
+            texture_descriptor.setUsage(MTLTextureUsage::ShaderWrite | MTLTextureUsage::ShaderRead);
+            let render_texture = (0..frame_in_flight)
+                .map(|_| {
+                    device
+                        .newTextureWithDescriptor(&texture_descriptor)
+                        .expect("Failed to create render texture")
+                })
+                .collect::<Vec<_>>();
+            let residency_desc =
+                MTLResidencySetDescriptor::init(MTLResidencySetDescriptor::alloc());
+
+            let residency_set = device
+                .newResidencySetWithDescriptor_error(&residency_desc)
+                .unwrap();
+
+            for i in 0..frame_in_flight {
+                let _: () = msg_send![&*residency_set, addAllocation: &*render_texture[i]];
+                let _: () = msg_send![&*residency_set, addAllocation: &*camera_buffer[i]];
+            }
+
+            let bounding_box_buffer = device
+                .newBufferWithLength_options(32, MTLResourceOptions::StorageModeShared)
+                .unwrap();
+            #[repr(C)]
+            struct BoundingBox {
+                min: [f32; 3],
+                max: [f32; 3],
+            }
+
+            let bbox = BoundingBox {
+                min: [-0.5, -0.5, -0.5],
+                max: [0.5, 0.5, 0.5],
+            };
+            *bounding_box_buffer
+                .contents()
+                .cast::<BoundingBox>()
+                .as_mut() = bbox;
+            let instance_count_buffer = device
+                .newBufferWithLength_options(32, MTLResourceOptions::StorageModeShared)
+                .unwrap();
+
+            *instance_count_buffer.contents().cast::<u32>().as_mut() = 1;
+
+            let visible_function_table_desc = MTLVisibleFunctionTableDescriptor::new();
+            visible_function_table_desc.setFunctionCount(1);
+
+            let visible_function_table = raytrace
+                .newVisibleFunctionTableWithDescriptor(&visible_function_table_desc)
+                .expect("Failed to create visible function table");
+
+            // Get the intersection function handle
+            let intersect_name = NSString::from_str("sphere_intersect");
+            let intersect_function_handle = raytrace
+                .functionHandleWithFunction(&library.newFunctionWithName(&intersect_name).unwrap())
+                .expect("Failed to get function handle");
+
+            // Set it in the table at index 0
+            visible_function_table.setFunction_atIndex(Some(&intersect_function_handle), 0);
+
+            let geometry = MTL4AccelerationStructureBoundingBoxGeometryDescriptor::init(
+                MTL4AccelerationStructureBoundingBoxGeometryDescriptor::alloc(),
+            );
+            geometry.setBoundingBoxCount(1);
+            geometry.setBoundingBoxStride(24);
+            geometry.setBoundingBoxBuffer(MTL4BufferRange {
+                bufferAddress: bounding_box_buffer.gpuAddress(),
+                length: 32,
+            });
+            geometry.setIntersectionFunctionTableOffset(0);
+            geometry.setOpaque(false);
+
+            let accel_desc = MTL4PrimitiveAccelerationStructureDescriptor::init(
+                MTL4PrimitiveAccelerationStructureDescriptor::alloc(),
+            );
+
+            let geometry_array = NSArray::from_slice(&[&*geometry]);
+            let _: () = msg_send![&*accel_desc, setGeometryDescriptors:&*geometry_array];
+            let prim_accel =
+                create_accel(&device, &command_queue, &command_allocator[0], &&accel_desc);
+
+            let instance_buffer = device
                 .newBufferWithLength_options(512, MTLResourceOptions::StorageModeShared)
                 .unwrap();
 
+            *instance_buffer
+                .contents()
+                .cast::<MTLIndirectAccelerationStructureInstanceDescriptor>()
+                .as_mut() = MTLIndirectAccelerationStructureInstanceDescriptor {
+                transformationMatrix: MTLPackedFloat4x3 {
+                    columns: [
+                        MTLPackedFloat3 {
+                            x: 1.0,
+                            y: 0.0,
+                            z: 0.0,
+                        },
+                        MTLPackedFloat3 {
+                            x: 0.0,
+                            y: 1.0,
+                            z: 0.0,
+                        },
+                        MTLPackedFloat3 {
+                            x: 0.0,
+                            y: 0.0,
+                            z: 1.0,
+                        },
+                        MTLPackedFloat3 {
+                            x: 0.0,
+                            y: 0.0,
+                            z: 0.0,
+                        }, // translation
+                    ],
+                },
+                options: MTLAccelerationStructureInstanceOptions::NonOpaque,
+                mask: 1,
+                intersectionFunctionTableOffset: 0,
+                userID: 0,
+                accelerationStructureID: prim_accel.gpuResourceID(),
+            };
+
+            let mut instance_desc = MTL4IndirectInstanceAccelerationStructureDescriptor::init(
+                MTL4IndirectInstanceAccelerationStructureDescriptor::alloc(),
+            );
+
+            instance_desc.setMaxInstanceCount(1);
+            instance_desc.setInstanceCountBuffer(MTL4BufferRange {
+                bufferAddress: instance_count_buffer.gpuAddress(),
+                length: 32,
+            });
+            instance_desc.setInstanceDescriptorBuffer(MTL4BufferRange {
+                bufferAddress: instance_buffer.gpuAddress(),
+                length: 512,
+            });
+            instance_desc.setInstanceDescriptorType(
+                MTLAccelerationStructureInstanceDescriptorType::Indirect,
+            );
+
+            let instance_accel = create_accel(
+                &device,
+                &command_queue,
+                &command_allocator[0],
+                &instance_desc,
+            );
+            unsafe fn create_accel(
+                device: &ProtocolObject<dyn MTLDevice>,
+                queue: &ProtocolObject<dyn MTL4CommandQueue>,
+                accel_allocator: &ProtocolObject<dyn MTL4CommandAllocator>,
+                accel_desc: &MTL4AccelerationStructureDescriptor,
+            ) -> Retained<ProtocolObject<dyn MTLAccelerationStructure>> {
+                let accel_size = device.accelerationStructureSizesWithDescriptor(accel_desc);
+
+                let accel_struct = device
+                    .newAccelerationStructureWithSize(accel_size.accelerationStructureSize)
+                    .unwrap();
+
+                let accel_scratch = device
+                    .newBufferWithLength_options(
+                        accel_size.buildScratchBufferSize,
+                        MTLResourceOptions::StorageModePrivate,
+                    )
+                    .unwrap();
+
+                accel_allocator.reset();
+                let command_buffer = device.newCommandBuffer().unwrap();
+
+                command_buffer.beginCommandBufferWithAllocator(accel_allocator);
+
+                let encoder = command_buffer.computeCommandEncoder().unwrap();
+
+                encoder.buildAccelerationStructure_descriptor_scratchBuffer(
+                    &*accel_struct,
+                    &*accel_desc,
+                    MTL4BufferRange {
+                        bufferAddress: accel_scratch.gpuAddress(),
+                        length: accel_size.buildScratchBufferSize as u64,
+                    },
+                );
+
+                encoder.endEncoding();
+                command_buffer.endCommandBuffer();
+                let cmd_ptr = NonNull::from(&*command_buffer);
+                let mut cmd_array = [cmd_ptr];
+                let cmd_array_ptr = NonNull::new_unchecked(cmd_array.as_mut_ptr());
+
+                queue.commit_count(cmd_array_ptr, 1);
+
+                accel_struct
+            }
+
             let argument_table_descriptor = MTL4ArgumentTableDescriptor::new();
-            argument_table_descriptor.setMaxTextureBindCount(1);
-            argument_table_descriptor.setMaxBufferBindCount(1);
+            argument_table_descriptor.setMaxTextureBindCount(4);
+            argument_table_descriptor.setMaxBufferBindCount(4);
 
-            let argument_table = device
-                .newArgumentTableWithDescriptor_error(&argument_table_descriptor)
-                .expect("failed to make argument table");
+            let argument_table2 = (0..frame_in_flight)
+                .map(|_| {
+                    device
+                        .newArgumentTableWithDescriptor_error(&argument_table_descriptor)
+                        .expect("failed to make argument table")
+                })
+                .collect();
+            let argument_table = (0..frame_in_flight)
+                .map(|_| {
+                    device
+                        .newArgumentTableWithDescriptor_error(&argument_table_descriptor)
+                        .expect("failed to make argument table")
+                })
+                .collect();
 
+            let _: () = msg_send![&*residency_set, addAllocation: &*prim_accel];
+            let _: () = msg_send![&*residency_set, addAllocation: &*instance_accel];
+            residency_set.commit();
+            residency_set.requestResidency();
             Self {
                 frame: 0,
                 frame_in_flight,
                 camera_buffer,
+                render_size,
+                render_texture,
                 next_texture,
                 next_present,
                 device,
+                instance_accel,
+                residency_set,
                 command_queue,
                 command_allocator,
                 library,
                 frame_event,
                 argument_table,
+                argument_table2,
                 ui_raytrace,
+                upscale,
+                raytrace,
+                visible_function_table,
             }
         }
 
         unsafe fn render(&mut self, camera: crate::CameraData) {
+            if self.frame >= self.frame_in_flight {
+                let frame_to_wait = self.frame - self.frame_in_flight;
+                let done: bool = msg_send![&self.frame_event, waitUntilSignaledValue:frame_to_wait, timeoutMS:10usize];
+            }
+
             let frame_index = self.frame % self.frame_in_flight;
             self.frame += 1;
 
-            if self.frame > self.frame_in_flight {
-                let last_frame = (self.frame - 1) % self.frame_in_flight;
-                let _: bool = msg_send![&self.frame_event, waitUntilSignaledValue: last_frame, timeoutMS: 10u64];
-            }
-
-            let command_buffer = self
-                .device
-                .newCommandBuffer()
-                .expect("failed to create command buffer");
-            let frame_allocator = &self.command_allocator[frame_index];
-            frame_allocator.reset();
-            command_buffer.beginCommandBufferWithAllocator(frame_allocator);
             let (id, size) = (self.next_texture)();
-            *self.camera_buffer.contents().cast::<CameraData>().as_mut() = camera;
-            self.argument_table.setTexture_atIndex(id, 0);
-            self.argument_table
-                .setAddress_atIndex(self.camera_buffer.gpuAddress(), 1);
+
+            let command_buffer = self.device.newCommandBuffer().unwrap();
+            self.command_allocator[frame_index].reset();
+            command_buffer.beginCommandBufferWithAllocator(&self.command_allocator[frame_index]);
+            self.argument_table[frame_index]
+                .setTexture_atIndex(self.render_texture[frame_index].gpuResourceID(), 0);
+            self.argument_table[frame_index]
+                .setAddress_atIndex(self.camera_buffer[frame_index].gpuAddress(), 0);
+            self.argument_table[frame_index]
+                .setResource_atBufferIndex(self.instance_accel.gpuResourceID(), 1);
+            self.argument_table[frame_index]
+                .setResource_atBufferIndex(self.visible_function_table.gpuResourceID(), 2);
+
+            command_buffer.useResidencySet(&self.residency_set);
+
+            *self.camera_buffer[frame_index]
+                .contents()
+                .cast::<CameraData>()
+                .as_mut() = camera;
 
             let encoder = command_buffer
                 .computeCommandEncoder()
                 .expect("failed to make compute encoder");
 
+            encoder.setArgumentTable(Some(&self.argument_table[frame_index]));
             encoder.setComputePipelineState(&self.ui_raytrace);
-
-            encoder.setArgumentTable(Some(&self.argument_table));
+            let threadgroups_per_grid = MTLSize {
+                width: self.render_size.width as usize / 16 + 1,
+                height: self.render_size.height as usize / 16 + 1,
+                depth: 1,
+            };
+            let threads_per_threadgroup = MTLSize {
+                width: 16,
+                height: 16,
+                depth: 1,
+            };
             encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize {
-                    width: size.width as usize / 16 + 1,
-                    height: size.height as usize / 16 + 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: 16,
-                    height: 16,
-                    depth: 1,
-                },
+                threadgroups_per_grid,
+                threads_per_threadgroup,
             );
-            println!(
-                "{:?} {:?}",
-                MTLSize {
-                    width: size.width as usize / 16 + 1,
-                    height: size.height as usize / 16 + 1,
-                    depth: 1
-                },
-                MTLSize {
-                    width: 16,
-                    height: 16,
-                    depth: 1
-                }
+
+            encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+                MTLStages::Dispatch,
+                MTLStages::Dispatch,
+                MTL4VisibilityOptions::Device,
+            );
+
+            encoder.setComputePipelineState(&self.raytrace);
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                threadgroups_per_grid,
+                threads_per_threadgroup,
+            );
+
+            encoder.barrierAfterStages_beforeQueueStages_visibilityOptions(
+                MTLStages::Dispatch,
+                MTLStages::Fragment,
+                MTL4VisibilityOptions::Device,
             );
 
             encoder.endEncoding();
+            self.argument_table2[frame_index]
+                .setTexture_atIndex(self.render_texture[frame_index].gpuResourceID(), 0);
+
+            let attachment = MTLRenderPassColorAttachmentDescriptor::init(
+                MTLRenderPassColorAttachmentDescriptor::alloc(),
+            );
+
+            attachment.setTexture(Some(&id));
+
+            let render_descriptor =
+                MTL4RenderPassDescriptor::init(MTL4RenderPassDescriptor::alloc());
+            render_descriptor.setRenderTargetWidth(size.width as _);
+
+            render_descriptor.setRenderTargetHeight(size.height as _);
+            render_descriptor
+                .colorAttachments()
+                .setObject_atIndexedSubscript(Some(&attachment), 0);
+
+            let render_encoder = command_buffer
+                .renderCommandEncoderWithDescriptor(&render_descriptor)
+                .unwrap();
+
+            render_encoder.setArgumentTable_atStages(
+                &self.argument_table2[frame_index],
+                MTLRenderStages::Fragment,
+            );
+            render_encoder.setRenderPipelineState(&self.upscale);
+            render_encoder.setViewport(MTLViewport {
+                originX: 0.0,
+                originY: 0.0,
+                width: size.width,
+                height: size.height,
+                znear: 0.0,
+                zfar: 1.0,
+            });
+
+            render_encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+
+            render_encoder.endEncoding();
+
             command_buffer.endCommandBuffer();
 
+            LATEST_CMDS = Some(command_buffer);
             let mut present = self.next_present.take();
-            (present.as_mut().unwrap())(self, command_buffer);
+            (present.as_mut().unwrap())(self);
             self.next_present = present;
-
             let _: () =
-                msg_send![&*self.command_queue, signalEvent:&*self.frame_event, value:frame_index];
-
+                msg_send![&*self.command_queue, signalEvent:&*self.frame_event, value:self.frame];
+            // Signal with the actual frame number, not the index
             println!("presenting!");
-            thread::sleep(Duration::from_secs_f32(1.0 / 120.0));
         }
     }
 
@@ -661,7 +1010,7 @@ pub mod darwin {
             let metal = Metal::init(
                 window.borrow_mut().device(),
                 Box::new(move || draw.borrow_mut().next()),
-                Box::new(move |metal, commands| present.borrow_mut().draw(metal, commands)),
+                Box::new(move |metal| present.borrow_mut().draw(metal)),
             );
             let metal = RefCell::new(metal);
             Self {
@@ -676,7 +1025,7 @@ pub mod darwin {
         }
         pub fn camera_data(&self) -> crate::CameraData {
             use crate::CameraData;
-            let screen_size = self.window.borrow().screen_size();
+            let screen_size = self.metal.borrow().render_size;
             let native_scale = self.window.borrow().native_scale();
             let camera_pos = self.camera_pos.borrow();
             let projection = Projection {
@@ -694,10 +1043,9 @@ pub mod darwin {
             let rotation = Quaternion::from_axis_angle(up, *self.angle.borrow());
 
             let rotated_direction = rotation * base_direction;
-            let pos = rotated_direction * distance;
+            let pos = center + rotated_direction * distance;
             dbg!(center, pos, rotated_direction, distance);
-            let mut transform =
-                Quaternion::look_rotation((center - pos).normalize(), up).to_matrix();
+            let mut transform = Quaternion::look_rotation(-rotated_direction, up).to_matrix();
             for i in 0..3 {
                 transform[(i, 3)] = pos[i];
             }
@@ -707,7 +1055,12 @@ pub mod darwin {
                 projection_inverse: dbg!(projection.to_matrix().inverse().unwrap()),
                 view: transform.inverse().unwrap(),
                 transform,
-                resolution: Vector([screen_size[0], screen_size[1], native_scale, 0.0]),
+                resolution: Vector([
+                    screen_size.width as f32,
+                    screen_size.height as f32,
+                    native_scale as f32,
+                    0.0,
+                ]),
             }
         }
         fn pan_screen_in_world(
@@ -756,7 +1109,8 @@ pub mod darwin {
             let current_zoom = *self.zoom.borrow();
             *self.zoom.borrow_mut() = dbg!(current_zoom.clamp(0.0, 1.0));
             *self.zoom_vel.borrow_mut() *= 0.8;
-            unsafe { self.metal.borrow_mut().render(self.camera_data()) }
+            let camera_data = self.camera_data();
+            unsafe { self.metal.borrow_mut().render(camera_data) }
         }
     }
 
