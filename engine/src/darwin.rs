@@ -13,6 +13,7 @@ use objc2_metal_kit::*;
 use objc2_quartz_core::*;
 use objc2_ui_kit::*;
 
+use crate::darwin::rtx::{BoundingBox, GeometryDescriptor, InstanceDescriptor};
 use crate::math::*;
 
 use crate::{CameraData, Input, Matrix, Projection, Quaternion, Vector};
@@ -208,6 +209,7 @@ impl Surface {
 }
 pub type Size = NSSize;
 
+pub static mut REBUILT: bool = false;
 pub static mut LATEST_CMDS: Option<CommandBufferProtocol> = None;
 
 pub struct Window {
@@ -313,19 +315,43 @@ impl From<NSPoint> for crate::Vector<2, f32> {
     }
 }
 mod rtx {
-    use std::{collections::HashMap, hash::Hash, mem, ptr::NonNull};
+    use std::{
+        collections::{BTreeSet, HashMap},
+        hash::Hash,
+        mem,
+        ops::Bound,
+        ptr::NonNull,
+    };
 
     use crate::{
-        Quaternion, Vector,
+        Matrix, Quaternion, Vector,
         darwin::{
-            BufferProtocol, CommandBufferProtocol, DeviceProtocol, LibraryProtocol,
-            ResidencyProtocol,
+            BufferProtocol, CommandBufferProtocol, DeviceProtocol, FunctionProtocol,
+            LibraryProtocol, ResidencyProtocol,
         },
     };
 
     use objc2::{AnyThread, msg_send, rc::Retained, runtime::ProtocolObject};
     use objc2_foundation::{NSArray, NSString};
     use objc2_metal::*;
+
+    impl From<Matrix<4, 4, f32>> for objc2_metal::MTLPackedFloat4x3 {
+        fn from(value: Matrix<4, 4, f32>) -> Self {
+            let mut ret = unsafe { mem::zeroed::<Self>() };
+            let mut ptr = ret.columns.as_mut_ptr().cast::<f32>();
+            for col in 0..4 {
+                for row in 0..3 {
+                    unsafe {
+                        *ptr = value[(row, col)];
+                        println!("{:?}", value[(row, col)]);
+                        ptr = ptr.add(1);
+                    }
+                }
+            }
+            ret
+        }
+    }
+
     pub type AccelerationStructureProtocol = Retained<ProtocolObject<dyn MTLAccelerationStructure>>;
 
     #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -376,12 +402,12 @@ mod rtx {
         primitive: Option<AccelerationStructureProtocol>,
         descriptor: GeometryDescriptor,
         bbox_index: usize,
-        intersection_func_index: Option<usize>,
+        intersection_func_index: Option<u32>,
         dirty: bool,
     }
     pub struct InstanceData {
         descriptor: InstanceDescriptor,
-        instance_index: usize,
+        index: usize,
         dirty: bool,
     }
     pub struct AccelerationStructure {
@@ -406,36 +432,42 @@ mod rtx {
         instance_count: BufferProtocol,
 
         library: LibraryProtocol,
-        linked: Retained<MTLLinkedFunctions>,
+        linked: Option<Retained<MTLLinkedFunctions>>,
+        functions: Option<Vec<FunctionProtocol>>,
 
         scratch: BufferProtocol,
         scratch_size: usize,
+        scratch_offset: usize,
 
-        instance_accel: Option<AccelerationStructureProtocol>,
+        structure: Option<AccelerationStructureProtocol>,
 
         pending: Vec<PendingOp>,
 
         rebuild: bool,
+        rebuild_callback: Option<Box<dyn AccelerationStructureRebuild>>,
         resize: bool,
     }
+
+    pub trait AccelerationStructureRebuild = FnMut(&AccelerationStructure) + 'static;
 
     impl AccelerationStructure {
         const MAX_FUNCTIONS: usize = 16;
         pub fn new(
-            device: DeviceProtocol,
-            residency: ResidencyProtocol,
-            library: LibraryProtocol,
+            device: &DeviceProtocol,
+            residency: &ResidencyProtocol,
+            library: &LibraryProtocol,
         ) -> Self {
             Self::with_capacity(device, residency, library, 256, 4096, 16 * 1024 * 1024)
         }
         pub fn with_capacity(
-            device: DeviceProtocol,
-            residency: ResidencyProtocol,
-            library: LibraryProtocol,
+            device: &DeviceProtocol,
+            residency: &ResidencyProtocol,
+            library: &LibraryProtocol,
             geometry_capacity: usize,
             instance_capacity: usize,
             scratch_size: usize,
         ) -> Self {
+            let (device, residency, library) = (device.clone(), residency.clone(), library.clone());
             let bbox = device
                 .newBufferWithLength_options(
                     instance_capacity * mem::size_of::<BoundingBox>(),
@@ -466,8 +498,6 @@ mod rtx {
             residency.commit();
             residency.requestResidency();
 
-            let linked = Self::link_intersect_functions(vec![], &library);
-
             Self {
                 device,
                 residency,
@@ -484,14 +514,20 @@ mod rtx {
                 instance_indirect_used: 0,
                 instance_count,
                 scratch,
+                scratch_offset: 0,
                 scratch_size,
                 library,
-                linked,
-                instance_accel: None,
+                linked: None,
+                structure: None,
                 pending: vec![],
+                functions: None,
                 rebuild: false,
+                rebuild_callback: None,
                 resize: false,
             }
+        }
+        pub fn set_rebuild_callback(&mut self, cb: impl AccelerationStructureRebuild) {
+            self.rebuild_callback = Some(Box::new(cb));
         }
         pub fn add_geometry(&mut self, descriptor: GeometryDescriptor) -> Geometry {
             let id = Geometry(self.next_geometry);
@@ -555,14 +591,30 @@ mod rtx {
                 self.resize = false;
             }
             if self.rebuild {
-                self.rebuild_structures();
+                self.rebuild_linked_functions();
+                self.rebuild_primitive_structures(cmd);
+                self.rebuild_instance_structure(cmd);
+                if self.rebuild_callback.is_some() {
+                    let mut rebuild_callback = self.rebuild_callback.take().unwrap();
+                    (rebuild_callback)(self);
+                    self.rebuild_callback = Some(rebuild_callback);
+                }
                 self.rebuild = false;
             }
         }
-        fn link_intersect_functions(
+        pub fn linked(&self) -> Option<&MTLLinkedFunctions> {
+            self.linked.as_ref().map(|x| &**x)
+        }
+        pub fn functions(&self) -> Option<&[FunctionProtocol]> {
+            self.functions.as_ref().map(|x| x.as_slice())
+        }
+        pub fn protocol(&self) -> Option<&AccelerationStructureProtocol> {
+            self.structure.as_ref()
+        }
+        fn build_intersect_functions(
             names: Vec<String>,
             library: &LibraryProtocol,
-        ) -> Retained<MTLLinkedFunctions> {
+        ) -> (Vec<FunctionProtocol>, Retained<MTLLinkedFunctions>) {
             let functions = names
                 .into_iter()
                 .map(|name| {
@@ -595,12 +647,238 @@ mod rtx {
 
             let linked = MTLLinkedFunctions::init(MTLLinkedFunctions::alloc());
             linked.setFunctions(Some(&NSArray::from_slice(&*function_refs)));
-            linked
+            (functions, linked)
         }
 
-        fn resize_buffers(&mut self) {}
+        fn resize_buffers(&mut self) {
+            if self.bbox_used >= self.bbox_capacity {
+                self.resize_bbox();
+            }
+            if self.instance_indirect_used >= self.instance_indirect_capacity {
+                self.resize_instance();
+            }
+        }
 
-        fn rebuild_structures(&mut self) {}
+        fn resize_bbox(&mut self) {
+            let new_capacity = (self.bbox_capacity * 2).max(self.bbox_used);
+            let new_size = new_capacity * std::mem::size_of::<BoundingBox>();
+
+            let new_buffer = self
+                .device
+                .newBufferWithLength_options(new_size, MTLResourceOptions::StorageModeShared)
+                .expect("Failed to resize bbox buffer");
+
+            // Copy existing data
+            let old_ptr = self.bbox.contents().cast::<u8>().as_ptr();
+            let new_ptr = new_buffer.contents().cast::<u8>().as_ptr();
+            let copy_size = self.bbox_used * std::mem::size_of::<BoundingBox>();
+            unsafe { std::ptr::copy_nonoverlapping(old_ptr, new_ptr, copy_size) };
+
+            unsafe {
+                let _: () = msg_send![&*self.residency, addAllocation: &*new_buffer];
+            }
+            self.bbox = new_buffer;
+            self.bbox_capacity = new_capacity;
+
+            // Mark all geometries as dirty
+            for geometry in self.geometry.values_mut() {
+                geometry.dirty = true;
+            }
+        }
+
+        fn resize_instance(&mut self) {
+            let new_capacity =
+                (self.instance_indirect_capacity * 2).max(self.instance_indirect_used);
+            let new_size = new_capacity
+                * std::mem::size_of::<MTLIndirectAccelerationStructureInstanceDescriptor>();
+
+            let new_buffer = self
+                .device
+                .newBufferWithLength_options(new_size, MTLResourceOptions::StorageModeShared)
+                .expect("Failed to resize instance buffer");
+
+            unsafe {
+                let _: () = msg_send![&*self.residency, addAllocation: &*new_buffer];
+            }
+            self.instance_indirect = new_buffer;
+            self.instance_indirect_capacity = new_capacity;
+
+            // Mark all instances as dirty
+            for instance in self.instance.values_mut() {
+                instance.dirty = true;
+            }
+        }
+
+        fn rebuild_linked_functions(&mut self) {
+            let sorted_geometry = self
+                .geometry
+                .keys()
+                .copied()
+                .collect::<BTreeSet<Geometry>>();
+            let sorted_geometry_names = sorted_geometry
+                .into_iter()
+                .map(|x| &self.geometry[&x])
+                .map(|x| x.descriptor.func.name.clone())
+                .collect::<Vec<_>>();
+
+            let (functions, linked) =
+                Self::build_intersect_functions(sorted_geometry_names, &self.library);
+
+            self.functions = Some(functions);
+            self.linked = Some(linked);
+        }
+
+        fn rebuild_instance_structure(&mut self, cmd: &CommandBufferProtocol) {
+            let instance_ptr = self
+                .instance_indirect
+                .contents()
+                .cast::<MTLIndirectAccelerationStructureInstanceDescriptor>()
+                .as_ptr();
+
+            for (id, data) in self.instance.iter_mut().filter(|(_, data)| data.dirty) {
+                let geometry = self
+                    .geometry
+                    .get(&data.descriptor.geometry)
+                    .expect("instance references non existant geometry");
+
+                let transform = Matrix::from_translation(data.descriptor.position)
+                    * data.descriptor.rotation.to_matrix();
+                let opaque = if geometry.descriptor.opaque {
+                    MTLAccelerationStructureInstanceOptions::Opaque
+                } else {
+                    MTLAccelerationStructureInstanceOptions::NonOpaque
+                };
+                let mask = data.descriptor.mask;
+                let primitive = geometry.primitive.as_ref().unwrap().gpuResourceID();
+
+                unsafe {
+                    *instance_ptr.add(data.index) =
+                        MTLIndirectAccelerationStructureInstanceDescriptor {
+                            transformationMatrix: transform.into(),
+                            options: opaque,
+                            mask,
+                            intersectionFunctionTableOffset: 0,
+                            userID: 0,
+                            accelerationStructureID: primitive,
+                        }
+                }
+
+                data.dirty = true;
+            }
+
+            let instance_count = self.instance.len();
+            if instance_count == 0 {
+                self.structure = None;
+                return;
+            }
+
+            *unsafe { self.instance_count.contents().cast::<u32>().as_mut() } =
+                instance_count as u32;
+
+            let mut descriptor = MTL4IndirectInstanceAccelerationStructureDescriptor::init(
+                MTL4IndirectInstanceAccelerationStructureDescriptor::alloc(),
+            );
+
+            unsafe {
+                descriptor.setMaxInstanceCount(instance_count);
+                descriptor.setInstanceDescriptorStride(std::mem::size_of::<
+                    MTLIndirectAccelerationStructureInstanceDescriptor,
+                >());
+                descriptor.setInstanceCountBuffer(MTL4BufferRange {
+                    bufferAddress: self.instance_count.gpuAddress(),
+                    length: 32,
+                });
+                descriptor.setInstanceDescriptorBuffer(MTL4BufferRange {
+                    bufferAddress: self.instance_indirect.gpuAddress(),
+                    length: (instance_count
+                        * std::mem::size_of::<MTLIndirectAccelerationStructureInstanceDescriptor>())
+                        as u64,
+                });
+                descriptor.setInstanceDescriptorType(
+                    MTLAccelerationStructureInstanceDescriptorType::Indirect,
+                );
+            }
+            unsafe {
+                // CRITICAL: Ensure all buffers are in the residency set and committed
+                let _: () = msg_send![&*self.residency, addAllocation: &*self.bbox];
+                let _: () = msg_send![&*self.residency, addAllocation: &*self.instance_indirect];
+                let _: () = msg_send![&*self.residency, addAllocation: &*self.instance_count];
+                let _: () = msg_send![&*self.residency, addAllocation: &*self.scratch];
+
+                self.residency.commit();
+                self.residency.requestResidency();
+
+                // Use the residency set AFTER committing and requesting residency
+                cmd.useResidencySet(&self.residency);
+            }
+            let structure = unsafe { self.build_acceleration_structure(&cmd, &descriptor) };
+            self.structure = Some(structure);
+        }
+        fn rebuild_primitive_structures(&mut self, cmd: &CommandBufferProtocol) {
+            let mut geometry = mem::take(&mut self.geometry);
+            let mut set = HashMap::new();
+
+            for (geometry, mut data) in geometry
+                .into_iter()
+                .filter(|(_, x)| x.dirty || x.primitive.is_none())
+            {
+                let intersection_function_table_offset = geometry.0;
+
+                let mut primitive_geometry_descriptor =
+                    MTL4AccelerationStructureBoundingBoxGeometryDescriptor::init(
+                        MTL4AccelerationStructureBoundingBoxGeometryDescriptor::alloc(),
+                    );
+
+                unsafe {
+                    primitive_geometry_descriptor.setBoundingBoxCount(1);
+                    primitive_geometry_descriptor
+                        .setBoundingBoxStride(mem::size_of::<BoundingBox>());
+                }
+                let bbox_addr_base = self.bbox.gpuAddress();
+                let bbox_addr_offset = (data.bbox_index * mem::size_of::<BoundingBox>()) as u64;
+                let bbox_addr = bbox_addr_base + bbox_addr_offset;
+
+                primitive_geometry_descriptor.setBoundingBoxBuffer(MTL4BufferRange {
+                    bufferAddress: bbox_addr,
+                    length: mem::size_of::<BoundingBox>() as u64,
+                });
+                unsafe {
+                    primitive_geometry_descriptor
+                        .setIntersectionFunctionTableOffset(intersection_function_table_offset);
+                }
+                primitive_geometry_descriptor.setOpaque(data.descriptor.opaque);
+
+                let primitive_descriptor = MTL4PrimitiveAccelerationStructureDescriptor::init(
+                    MTL4PrimitiveAccelerationStructureDescriptor::alloc(),
+                );
+
+                let geometry_array = NSArray::from_slice(&[&*primitive_geometry_descriptor]);
+                unsafe {
+                    let _: () =
+                        msg_send![&*primitive_descriptor, setGeometryDescriptors:&*geometry_array];
+                }
+
+                unsafe {
+                    // CRITICAL: Ensure all buffers are in the residency set and committed
+                    let _: () = msg_send![&*self.residency, addAllocation: &*self.bbox];
+                    let _: () =
+                        msg_send![&*self.residency, addAllocation: &*self.instance_indirect];
+                    let _: () = msg_send![&*self.residency, addAllocation: &*self.instance_count];
+                    let _: () = msg_send![&*self.residency, addAllocation: &*self.scratch];
+
+                    self.residency.commit();
+                    self.residency.requestResidency();
+
+                    // Use the residency set AFTER committing and requesting residency
+                    cmd.useResidencySet(&self.residency);
+                }
+                let acceleration_structure =
+                    unsafe { self.build_acceleration_structure(&cmd, &primitive_descriptor) };
+                data.primitive = Some(acceleration_structure);
+                set.insert(geometry, data);
+            }
+            mem::swap(&mut set, &mut self.geometry);
+        }
 
         fn add_geometry_commit(
             &mut self,
@@ -654,15 +932,15 @@ mod rtx {
                 self.resize = true;
             }
 
-            let instance_index = self.instance_indirect_used;
+            let index = self.instance_indirect_used;
             self.instance_indirect_used += 1;
 
-            self.instance_to_offset.insert(id, instance_index);
+            self.instance_to_offset.insert(id, index);
             self.instance.insert(
                 id,
                 InstanceData {
                     descriptor,
-                    instance_index,
+                    index,
                     dirty: true,
                 },
             );
@@ -683,6 +961,44 @@ mod rtx {
             self.instance.remove(&id);
             self.instance_to_offset.remove(&id);
         }
+        pub unsafe fn build_acceleration_structure(
+            &mut self,
+            command_buffer: &ProtocolObject<dyn MTL4CommandBuffer>,
+            accel_desc: &MTL4AccelerationStructureDescriptor,
+        ) -> Retained<ProtocolObject<dyn MTLAccelerationStructure>> {
+            let accel_size = self
+                .device
+                .accelerationStructureSizesWithDescriptor(accel_desc);
+
+            let accel_struct = self
+                .device
+                .newAccelerationStructureWithSize(accel_size.accelerationStructureSize)
+                .unwrap();
+
+            dbg!(accel_size.buildScratchBufferSize);
+
+            let _: () = msg_send![&*self.residency, addAllocation: &*accel_struct];
+            self.residency.commit();
+            self.residency.requestResidency();
+
+            command_buffer.useResidencySet(&self.residency);
+
+            let encoder = command_buffer.computeCommandEncoder().unwrap();
+
+            encoder.buildAccelerationStructure_descriptor_scratchBuffer(
+                &*accel_struct,
+                &*accel_desc,
+                MTL4BufferRange {
+                    bufferAddress: self.scratch.gpuAddress() + self.scratch_offset as u64,
+                    length: accel_size.buildScratchBufferSize as u64,
+                },
+            );
+            self.scratch_offset += accel_size.buildScratchBufferSize;
+
+            encoder.endEncoding();
+
+            accel_struct
+        }
     }
 }
 
@@ -697,6 +1013,7 @@ pub type EventProtocol = Retained<ProtocolObject<dyn MTLSharedEvent>>;
 pub type ComputePipelineProtocol = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 pub type ArgumentTableProtocol = Retained<ProtocolObject<dyn MTL4ArgumentTable>>;
 pub type BufferProtocol = Retained<ProtocolObject<dyn MTLBuffer>>;
+pub type FunctionProtocol = Retained<ProtocolObject<dyn MTLFunction>>;
 pub type IntersectionFunctionTableProtocol =
     Retained<ProtocolObject<dyn MTLIntersectionFunctionTable>>;
 pub type RenderPipelineProtocol = Retained<ProtocolObject<dyn MTLRenderPipelineState>>;
@@ -714,13 +1031,13 @@ pub struct Metal {
     command_allocator: Vec<CommandAllocatorProtocol>,
     library: LibraryProtocol,
     frame_event: EventProtocol,
-    ui_raytrace: ComputePipelineProtocol,
     argument_table: Vec<ArgumentTableProtocol>,
     argument_table2: Vec<ArgumentTableProtocol>,
     camera_buffer: Vec<BufferProtocol>,
-    interesection_table: IntersectionFunctionTableProtocol,
     upscale: RenderPipelineProtocol,
-    raytrace: ComputePipelineProtocol,
+    acceleration_structure: rtx::AccelerationStructure,
+    raytrace: Option<ComputePipelineProtocol>,
+    intersect_table: Option<IntersectionFunctionTableProtocol>,
 }
 
 impl Metal {
@@ -754,15 +1071,6 @@ impl Metal {
             .newLibraryWithSource_options_error(&source, None)
             .expect("Failed to compile shader");
 
-        let ui_raytrace = {
-            let func_name = NSString::from_str("reference_grid");
-            let function = library
-                .newFunctionWithName(&func_name)
-                .expect("Function not found");
-            device
-                .newComputePipelineStateWithFunction_error(&function)
-                .expect("Failed to create pipeline")
-        };
         let upscale = {
             let func_name = NSString::from_str("upscale_vert");
             let vertex = library
@@ -788,44 +1096,6 @@ impl Metal {
             device
                 .newRenderPipelineStateWithDescriptor_error(&desc)
                 .expect("Failed to create pipeline")
-        };
-        let raytrace = {
-            let func_name = NSString::from_str("raytrace");
-            let rtx = library
-                .newFunctionWithName(&func_name)
-                .expect("Function not found");
-            let intersect_desc =
-                MTLIntersectionFunctionDescriptor::init(MTLIntersectionFunctionDescriptor::alloc());
-            intersect_desc.setName(Some(&NSString::from_str("sphere_intersect")));
-            let constant_values =
-                MTLFunctionConstantValues::init(MTLFunctionConstantValues::alloc());
-            constant_values.setConstantValue_type_atIndex(
-                NonNull::from_ref(&0u32).cast(),
-                MTLDataType::UInt,
-                1,
-            );
-            constant_values.setConstantValue_type_atIndex(
-                NonNull::from_ref(&true).cast(),
-                MTLDataType::Bool,
-                1,
-            );
-            intersect_desc.setConstantValues(Some(&constant_values));
-            let intersect = library
-                .newIntersectionFunctionWithDescriptor_error(&intersect_desc)
-                .unwrap();
-            let linked = MTLLinkedFunctions::init(MTLLinkedFunctions::alloc());
-            linked.setFunctions(Some(&NSArray::from_slice(&[&*intersect])));
-            let mut desc =
-                MTLComputePipelineDescriptor::init(MTLComputePipelineDescriptor::alloc());
-            desc.setComputeFunction(Some(&*rtx));
-            desc.setLinkedFunctions(Some(&*linked));
-            device
-                .newComputePipelineStateWithDescriptor_options_reflection_error(
-                    &*desc,
-                    MTLPipelineOption::empty(),
-                    None,
-                )
-                .unwrap()
         };
         let frame_event = device
             .newSharedEvent()
@@ -866,37 +1136,6 @@ impl Metal {
             let _: () = msg_send![&*residency_set, addAllocation: &*camera_buffer[i]];
         }
 
-        let intersection_function_table_desc = MTLIntersectionFunctionTableDescriptor::init(
-            MTLIntersectionFunctionTableDescriptor::alloc(),
-        );
-        intersection_function_table_desc.setFunctionCount(1);
-
-        // Create intersection function table from the PIPELINE STATE
-        let intersection_function_table = raytrace
-            .newIntersectionFunctionTableWithDescriptor(&intersection_function_table_desc)
-            .expect("deez");
-
-        // Get the intersection function handle (same as before)
-        let intersect_name = NSString::from_str("sphere_intersect");
-        let intersect_function_handle = raytrace
-            .functionHandleWithFunction(&library.newFunctionWithName(&intersect_name).unwrap())
-            .expect("Failed to get function handle");
-
-        // Set it in the intersection function table at index 0
-        intersection_function_table.setFunction_atIndex(Some(&intersect_function_handle), 0);
-
-        // Add to residency set
-        let _: () = msg_send![&*residency_set, addAllocation: &*intersection_function_table];
-
-        // Get the intersection function handle
-        let intersect_name = NSString::from_str("sphere_intersect");
-        let intersect_function_handle = raytrace
-            .functionHandleWithFunction(&library.newFunctionWithName(&intersect_name).unwrap())
-            .expect("Failed to get function handle");
-
-        residency_set.commit();
-        residency_set.requestResidency();
-
         let argument_table_descriptor =
             MTL4ArgumentTableDescriptor::init(MTL4ArgumentTableDescriptor::alloc());
         argument_table_descriptor.setMaxTextureBindCount(4);
@@ -920,6 +1159,30 @@ impl Metal {
         residency_set.commit();
         residency_set.requestResidency();
 
+        let mut acceleration_structure =
+            rtx::AccelerationStructure::new(&device, &residency_set, &library);
+
+        let sphere = acceleration_structure.add_geometry(GeometryDescriptor {
+            bounding_box: BoundingBox {
+                min: [-0.5, -0.5, -0.5],
+                max: [0.5, 0.5, 0.5],
+            },
+            func: rtx::IntersectionFunction {
+                name: "voxel_sphere_intersect".into(),
+            },
+            opaque: false,
+        });
+
+        acceleration_structure.add_instance(InstanceDescriptor {
+            geometry: sphere,
+            rotation: Quaternion::IDENTITY,
+            position: Vector::<3, f32>::X / 2.0,
+
+            mask: 1,
+            user_id: 0,
+        });
+        acceleration_structure.set_rebuild_callback(|accel| REBUILT = true);
+
         Self {
             frame: 0,
             frame_in_flight,
@@ -936,129 +1199,14 @@ impl Metal {
             frame_event,
             argument_table,
             argument_table2,
-            ui_raytrace,
             upscale,
-            raytrace,
-            interesection_table: intersection_function_table,
+            acceleration_structure,
+            raytrace: None,
+            intersect_table: None,
         }
     }
 
-    pub unsafe fn create_accel(
-        device: &ProtocolObject<dyn MTLDevice>,
-        command_buffer: &ProtocolObject<dyn MTL4CommandBuffer>,
-        accel_desc: &MTL4AccelerationStructureDescriptor,
-        residency_set: &ResidencyProtocol,
-    ) -> Retained<ProtocolObject<dyn MTLAccelerationStructure>> {
-        let accel_size = device.accelerationStructureSizesWithDescriptor(accel_desc);
-
-        let accel_struct = device
-            .newAccelerationStructureWithSize(accel_size.accelerationStructureSize)
-            .unwrap();
-
-        dbg!(accel_size.buildScratchBufferSize);
-
-        let accel_scratch = device
-            .newBufferWithLength_options(
-                accel_size.buildScratchBufferSize,
-                MTLResourceOptions::StorageModePrivate,
-            )
-            .unwrap();
-        let accel_scratch = Box::leak(Box::new(accel_scratch));
-
-        let _: () = msg_send![&*residency_set, addAllocation: &*accel_struct];
-        let _: () = msg_send![&*residency_set, addAllocation: &**accel_scratch];
-        residency_set.commit();
-        residency_set.requestResidency();
-
-        command_buffer.useResidencySet(residency_set);
-
-        let encoder = command_buffer.computeCommandEncoder().unwrap();
-
-        encoder.buildAccelerationStructure_descriptor_scratchBuffer(
-            &*accel_struct,
-            &*accel_desc,
-            MTL4BufferRange {
-                bufferAddress: accel_scratch.gpuAddress(),
-                length: accel_size.buildScratchBufferSize as u64,
-            },
-        );
-
-        encoder.endEncoding();
-
-        accel_struct
-    }
     unsafe fn render(&mut self, camera: crate::CameraData) {
-        let instance_buffer = self
-            .device
-            .newBufferWithLength_options(
-                std::mem::size_of::<MTLIndirectAccelerationStructureInstanceDescriptor>(),
-                MTLResourceOptions::StorageModeShared,
-            )
-            .unwrap();
-
-        let instance_count_buffer = self
-            .device
-            .newBufferWithLength_options(32, MTLResourceOptions::StorageModeShared)
-            .unwrap();
-
-        *instance_count_buffer.contents().cast::<u32>().as_mut() = 1;
-        let accel_desc = MTL4PrimitiveAccelerationStructureDescriptor::init(
-            MTL4PrimitiveAccelerationStructureDescriptor::alloc(),
-        );
-        let bounding_box_buffer = self
-            .device
-            .newBufferWithLength_options(32, MTLResourceOptions::StorageModeShared)
-            .unwrap();
-
-        let _: () = msg_send![&*self.residency_set, addAllocation: &*bounding_box_buffer];
-        #[repr(C)]
-        struct BoundingBox {
-            min: [f32; 3],
-            max: [f32; 3],
-        }
-
-        let bbox = BoundingBox {
-            min: [-0.5, -0.5, -0.5],
-            max: [0.5, 0.5, 0.5],
-        };
-        *bounding_box_buffer
-            .contents()
-            .cast::<BoundingBox>()
-            .as_mut() = bbox;
-
-        let geometry = MTL4AccelerationStructureBoundingBoxGeometryDescriptor::init(
-            MTL4AccelerationStructureBoundingBoxGeometryDescriptor::alloc(),
-        );
-        geometry.setBoundingBoxCount(1);
-        geometry.setBoundingBoxStride(24);
-        geometry.setBoundingBoxBuffer(MTL4BufferRange {
-            bufferAddress: bounding_box_buffer.gpuAddress(),
-            length: 32,
-        });
-        geometry.setIntersectionFunctionTableOffset(0);
-        geometry.setOpaque(false);
-        let geometry_array = NSArray::from_slice(&[&*geometry]);
-        let _: () = msg_send![&*accel_desc, setGeometryDescriptors:&*geometry_array];
-
-        let mut instance_desc = MTL4IndirectInstanceAccelerationStructureDescriptor::init(
-            MTL4IndirectInstanceAccelerationStructureDescriptor::alloc(),
-        );
-
-        instance_desc.setMaxInstanceCount(1);
-        instance_desc.setInstanceDescriptorStride(mem::size_of::<
-            MTLIndirectAccelerationStructureInstanceDescriptor,
-        >());
-        instance_desc.setInstanceCountBuffer(MTL4BufferRange {
-            bufferAddress: instance_count_buffer.gpuAddress(),
-            length: 32,
-        });
-        instance_desc.setInstanceDescriptorBuffer(MTL4BufferRange {
-            bufferAddress: instance_buffer.gpuAddress(),
-            length: mem::size_of::<MTLIndirectAccelerationStructureInstanceDescriptor>() as _,
-        });
-        instance_desc
-            .setInstanceDescriptorType(MTLAccelerationStructureInstanceDescriptorType::Indirect);
-
         if self.frame >= self.frame_in_flight {
             let frame_to_wait = self.frame - self.frame_in_flight;
             let done: bool = msg_send![&self.frame_event, waitUntilSignaledValue:frame_to_wait, timeoutMS:10usize];
@@ -1073,76 +1221,64 @@ impl Metal {
         self.command_allocator[frame_index].reset();
 
         let residency_set = &self.residency_set;
-        let _: () = msg_send![&*residency_set, addAllocation: &*instance_count_buffer];
-        let _: () = msg_send![&*residency_set, addAllocation: &*instance_buffer];
 
         residency_set.commit();
         residency_set.requestResidency();
 
         command_buffer.beginCommandBufferWithAllocator(&self.command_allocator[frame_index]);
 
-        let prim_accel = Self::create_accel(
-            &self.device,
-            &command_buffer,
-            &accel_desc,
-            &self.residency_set,
-        );
-        *instance_buffer
-            .contents()
-            .cast::<MTLIndirectAccelerationStructureInstanceDescriptor>()
-            .as_mut() = MTLIndirectAccelerationStructureInstanceDescriptor {
-            transformationMatrix: MTLPackedFloat4x3 {
-                columns: [
-                    MTLPackedFloat3 {
-                        x: 1.0,
-                        y: 0.0,
-                        z: 0.0,
-                    },
-                    MTLPackedFloat3 {
-                        x: 0.0,
-                        y: 1.0,
-                        z: 0.0,
-                    },
-                    MTLPackedFloat3 {
-                        x: 0.0,
-                        y: 0.0,
-                        z: 1.0,
-                    },
-                    MTLPackedFloat3 {
-                        x: 0.0,
-                        y: 0.0,
-                        z: 0.0,
-                    }, // translation
-                ],
-            },
-            options: MTLAccelerationStructureInstanceOptions::NonOpaque,
-            mask: 1,
-            intersectionFunctionTableOffset: 0,
-            userID: 0,
-            accelerationStructureID: prim_accel.gpuResourceID(),
-        };
-        let _: () = msg_send![&*residency_set, addAllocation: &*prim_accel];
-        residency_set.commit();
-        residency_set.requestResidency();
-        let instance_accel = Self::create_accel(
-            &self.device,
-            &command_buffer,
-            &instance_desc,
-            &self.residency_set,
-        );
-        let _: () = msg_send![&*residency_set, addAllocation: &*instance_accel];
-        residency_set.commit();
-        residency_set.requestResidency();
+        command_buffer.useResidencySet(&self.residency_set);
+        self.acceleration_structure.update(&command_buffer);
+
         self.argument_table[frame_index]
             .setTexture_atIndex(self.render_texture[frame_index].gpuResourceID(), 0);
         self.argument_table[frame_index]
             .setAddress_atIndex(self.camera_buffer[frame_index].gpuAddress(), 0);
-        self.argument_table[frame_index]
-            .setResource_atBufferIndex(instance_accel.gpuResourceID(), 1);
-        self.argument_table[frame_index]
-            .setResource_atBufferIndex(self.interesection_table.gpuResourceID(), 2);
 
-        command_buffer.useResidencySet(&self.residency_set);
+        if let Some(protocol) = self.acceleration_structure.protocol() {
+            self.argument_table[frame_index].setResource_atBufferIndex(protocol.gpuResourceID(), 1);
+        }
+        if REBUILT && let Some(functions) = self.acceleration_structure.functions() {
+            let func_name = NSString::from_str("raytrace");
+            let rtx = self
+                .library
+                .newFunctionWithName(&func_name)
+                .expect("Function not found");
+            let mut descriptor =
+                MTLComputePipelineDescriptor::init(MTLComputePipelineDescriptor::alloc());
+            descriptor.setComputeFunction(Some(&*rtx));
+            descriptor.setLinkedFunctions(Some(&*self.acceleration_structure.linked().unwrap()));
+            let raytrace = self
+                .device
+                .newComputePipelineStateWithDescriptor_options_reflection_error(
+                    &*descriptor,
+                    MTLPipelineOption::empty(),
+                    None,
+                )
+                .unwrap();
+
+            let mut descriptor = MTLIntersectionFunctionTableDescriptor::new();
+            descriptor.setFunctionCount(functions.len());
+
+            let intersect_table = raytrace
+                .newIntersectionFunctionTableWithDescriptor(&descriptor)
+                .unwrap();
+            for (index, function) in functions.iter().enumerate() {
+                let handle = raytrace.functionHandleWithFunction(function).unwrap();
+                intersect_table.setFunction_atIndex(Some(&*handle), index);
+            }
+
+            self.intersect_table = Some(intersect_table);
+
+            self.raytrace = Some(raytrace);
+
+            REBUILT = false;
+        }
+        if let Some(intersect_table) = self.intersect_table.as_ref() {
+            self.argument_table[frame_index]
+                .setResource_atBufferIndex(intersect_table.gpuResourceID(), 2);
+            let _: () = msg_send![&*self.residency_set, addAllocation: &**intersect_table];
+        }
 
         *self.camera_buffer[frame_index]
             .contents()
@@ -1154,7 +1290,6 @@ impl Metal {
             .expect("failed to make compute encoder");
 
         encoder.setArgumentTable(Some(&self.argument_table[frame_index]));
-        encoder.setComputePipelineState(&self.ui_raytrace);
         let threadgroups_per_grid = MTLSize {
             width: self.render_size.width as usize / 16 + 1,
             height: self.render_size.height as usize / 16 + 1,
@@ -1165,21 +1300,13 @@ impl Metal {
             height: 16,
             depth: 1,
         };
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
-            threadgroups_per_grid,
-            threads_per_threadgroup,
-        );
-
-        encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
-            MTLStages::Dispatch,
-            MTLStages::Dispatch,
-            MTL4VisibilityOptions::Device,
-        );
-        encoder.setComputePipelineState(&self.raytrace);
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
-            threadgroups_per_grid,
-            threads_per_threadgroup,
-        );
+        if let Some(raytrace) = &self.raytrace {
+            encoder.setComputePipelineState(&raytrace);
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                threadgroups_per_grid,
+                threads_per_threadgroup,
+            );
+        }
 
         encoder.barrierAfterStages_beforeQueueStages_visibilityOptions(
             MTLStages::All,

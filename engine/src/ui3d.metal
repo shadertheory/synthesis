@@ -193,7 +193,7 @@ float3 sphere_normal(float3 p) {
     return normalize(p);
 }
 [[intersection(bounding_box, instancing, world_space_data)]]
-IntersectionResult sphere_intersect(
+IntersectionResult voxel_sphere_intersect(
     float3 origin [[world_space_origin]],
     float3 direction [[world_space_direction]],
     uint primitiveID [[primitive_id]],

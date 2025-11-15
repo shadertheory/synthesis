@@ -5,7 +5,8 @@
     generic_const_exprs,
     associated_type_defaults,
     ptr_metadata,
-    box_as_ptr
+    box_as_ptr,
+    type_alias_impl_trait
 )]
 
 mod darwin;

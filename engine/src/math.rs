@@ -637,7 +637,7 @@ impl<T: Float> Quaternion<T> {
     }
 }
 impl<T: Num> Quaternion<T> {
-    const IDENTITY: Self = Self {
+    pub const IDENTITY: Self = Self {
         scalar: T::ONE,
         vector: Vector::<3, T>::ZERO,
     };
