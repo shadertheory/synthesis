@@ -1,22 +1,27 @@
+use core::array;
 use core::slice;
+use std::f32::EPSILON;
 use std::f32::consts::PI;
+use std::random;
+use std::random::DefaultRandomSource;
 use std::rc::Rc;
 use std::time::Duration;
 use std::{cell::RefCell, ptr::NonNull};
 use std::{mem, ptr, thread};
 
+use noise::NoiseFn;
 use objc2::{rc::*, runtime::*, *};
 use objc2_core_graphics::*;
 use objc2_foundation::*;
+use objc2_game_controller::GCController;
 use objc2_metal::*;
 use objc2_metal_kit::*;
 use objc2_quartz_core::*;
 use objc2_ui_kit::*;
+use rand::Rng;
 
 use crate::darwin::rtx::{BoundingBox, GeometryDescriptor, InstanceDescriptor};
-use crate::math::*;
-
-use crate::{CameraData, Input, Matrix, Projection, Quaternion, Vector};
+use math::*;
 
 pub trait PlatformDrawable = CAMetalDrawable;
 
@@ -40,9 +45,9 @@ impl Surface {
         app.windows().firstObject().unwrap().screen()
     }
 
-    pub fn size(&self) -> crate::Vector<2, f32> {
+    pub fn size(&self) -> Vector<2, f32> {
         let bounds: NSRect = unsafe { msg_send![&*self.screen, bounds] };
-        crate::Vector([bounds.size.width as f32, bounds.size.height as f32])
+        Vector([bounds.size.width as f32, bounds.size.height as f32])
     }
 
     pub unsafe fn new(view_controller: &'static UIViewController) -> Surface {
@@ -214,13 +219,14 @@ pub static mut LATEST_CMDS: Option<CommandBufferProtocol> = None;
 
 pub struct Window {
     surface: Surface,
+    controller: Option<Retained<GCController>>,
     pan: Retained<UIPanGestureRecognizer>,
     pinch: Retained<UIPinchGestureRecognizer>,
     rotate: Retained<UIRotationGestureRecognizer>,
     inputs: Vec<Input>,
 }
 impl Window {
-    pub fn screen_size(&self) -> crate::Vector<2, f32> {
+    pub fn screen_size(&self) -> Vector<2, f32> {
         self.surface.size()
     }
     pub fn native_scale(&self) -> f32 {
@@ -247,6 +253,7 @@ impl Window {
         let inputs = Vec::with_capacity(1024);
 
         Self {
+            controller: None,
             surface,
             pan,
             pinch,
@@ -260,6 +267,18 @@ impl Window {
     pub fn next(&mut self) -> (TextureProtocol, Size) {
         let (texture, size) = unsafe { self.surface.next() };
         (texture, size)
+    }
+    unsafe fn update_rotate(&mut self) {
+        let state: UIGestureRecognizerState = msg_send![&*self.rotate, state];
+
+        let velocity: f32 = match state {
+            UIGestureRecognizerState::Changed | UIGestureRecognizerState::Ended => {
+                self.rotate.velocity() as f32
+            }
+            _ => return,
+        };
+
+        self.inputs.push(Input::Rotate(-velocity));
     }
     unsafe fn update_pan(&mut self) {
         let state: UIGestureRecognizerState = msg_send![&*self.pan, state];
@@ -295,9 +314,40 @@ impl Window {
         };
         self.inputs.push(Input::Zoom(velocity));
     }
+    pub unsafe fn update_gamepad(&mut self) {
+        let Some(gamepad) = self.controller.as_mut() else {
+            self.controller = GCController::current();
+            return;
+        };
+
+        let Some(gamepad) = gamepad.extendedGamepad() else {
+            return;
+        };
+
+        let left_stick = gamepad.leftThumbstick();
+        self.inputs.push(Input::Move(Vector([
+            -left_stick.xAxis().value(),
+            left_stick.yAxis().value(),
+        ])));
+        let right_stick = gamepad.rightThumbstick();
+
+        let zoom_pot = right_stick.yAxis().value();
+
+        if zoom_pot.abs() >= EPSILON {
+            self.inputs.push(Input::Zoom(-zoom_pot));
+        }
+
+        let rot_pot = right_stick.xAxis().value();
+
+        if rot_pot.abs() >= EPSILON {
+            self.inputs.push(Input::Rotate(rot_pot));
+        }
+    }
     pub fn poll_input(&mut self) {
         unsafe {
+            self.update_gamepad();
             self.update_pan();
+            self.update_rotate();
             self.update_pinch();
         }
     }
@@ -309,10 +359,69 @@ impl Window {
         unsafe { self.surface.draw(metal) }
     }
 }
-impl From<NSPoint> for crate::Vector<2, f32> {
-    fn from(point: NSPoint) -> Self {
-        Self([point.x as f32, point.y as f32])
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct CameraData {
+    projection: Matrix<4, 4, f32>,
+    projection_inverse: Matrix<4, 4, f32>,
+    view: Matrix<4, 4, f32>,
+    transform: Matrix<4, 4, f32>,
+    resolution: Vector<4, f32>,
+    info: Vector<4, u32>,
+}
+
+impl CameraData {
+    fn unproject(
+        &self,
+        points: Vector<2, f32>,
+        size: Vector<2, f32>,
+        scale: f32,
+    ) -> Raycast<3, f32> {
+        // Convert to NDC space
+        let ndc = Vector([
+            points[0] / size[0] * 2.0 - 1.0,
+            points[1] / size[1] * 2.0 - 1.0,
+            1.0,
+            1.0,
+        ]);
+
+        // Unproject to view space
+        let view_pos = self.projection_inverse * ndc;
+
+        // Perspective divide to get view direction
+        let view_dir = Vector([
+            view_pos[0] / view_pos[3] * self.projection_inverse[(1, 1)],
+            view_pos[1] / view_pos[3] * self.projection_inverse[(0, 0)],
+            -view_pos[2] / view_pos[3],
+            0.0, // Direction vector (w=0)
+        ]);
+
+        // Transform to world space (direction remains unnormalized initially)
+        let world_dir = self.transform * view_dir;
+        let world_dir = Vector([world_dir[0], world_dir[1], world_dir[2]]);
+
+        // Extract camera position from transform matrix
+        let camera_pos = Vector([
+            self.transform[(0, 3)],
+            self.transform[(1, 3)],
+            self.transform[(2, 3)],
+        ]);
+
+        dbg!(ndc, view_dir, world_dir, camera_pos);
+
+        Raycast {
+            origin: camera_pos,
+            direction: -world_dir.normalize(),
+        }
     }
+}
+
+pub enum Input {
+    Pan(Vector<2, f32>, Vector<2, f32>),
+    Move(Vector<2, f32>),
+    Rotate(f32),
+    Zoom(f32),
 }
 mod rtx {
     use std::{
@@ -323,35 +432,15 @@ mod rtx {
         ptr::NonNull,
     };
 
-    use crate::{
-        Matrix, Quaternion, Vector,
-        darwin::{
-            BufferProtocol, CommandBufferProtocol, DeviceProtocol, FunctionProtocol,
-            LibraryProtocol, ResidencyProtocol,
-        },
+    use crate::darwin::{
+        BufferProtocol, CommandBufferProtocol, DeviceProtocol, FunctionProtocol, LibraryProtocol,
+        ResidencyProtocol,
     };
+    use math::*;
 
     use objc2::{AnyThread, msg_send, rc::Retained, runtime::ProtocolObject};
     use objc2_foundation::{NSArray, NSString};
     use objc2_metal::*;
-
-    impl From<Matrix<4, 4, f32>> for objc2_metal::MTLPackedFloat4x3 {
-        fn from(value: Matrix<4, 4, f32>) -> Self {
-            let mut ret = unsafe { mem::zeroed::<Self>() };
-            let mut ptr = ret.columns.as_mut_ptr().cast::<f32>();
-            for col in 0..4 {
-                for row in 0..3 {
-                    unsafe {
-                        *ptr = value[(row, col)];
-                        println!("{:?}", value[(row, col)]);
-                        ptr = ptr.add(1);
-                    }
-                }
-            }
-            ret
-        }
-    }
-
     pub type AccelerationStructureProtocol = Retained<ProtocolObject<dyn MTLAccelerationStructure>>;
 
     #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -365,20 +454,33 @@ mod rtx {
         pub max: [f32; 3],
     }
 
+    #[derive(Clone)]
     pub struct IntersectionFunction {
         pub name: String,
     }
 
+    #[derive(Clone)]
     pub struct GeometryDescriptor {
         pub bounding_box: BoundingBox,
         pub func: IntersectionFunction,
         pub opaque: bool,
     }
 
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    pub struct PerInstanceData {
+        pub transform: Matrix<4, 4, f32>,
+        pub inverse_transform: Matrix<4, 4, f32>,
+        pub min: Vector<4, f32>,
+        pub size: Vector<4, f32>,
+    }
+
+    #[derive(Clone, Copy)]
     pub struct InstanceDescriptor {
         pub geometry: Geometry,
         pub rotation: Quaternion<f32>,
         pub position: Vector<3, f32>,
+        pub scale: Vector<3, f32>,
         pub mask: u32,
         pub user_id: u32,
     }
@@ -402,7 +504,6 @@ mod rtx {
         primitive: Option<AccelerationStructureProtocol>,
         descriptor: GeometryDescriptor,
         bbox_index: usize,
-        intersection_func_index: Option<u32>,
         dirty: bool,
     }
     pub struct InstanceData {
@@ -415,6 +516,7 @@ mod rtx {
         residency: ResidencyProtocol,
 
         geometry: HashMap<Geometry, GeometryData>,
+        geometry_intersector: HashMap<Geometry, usize>,
         next_geometry: usize,
 
         instance: HashMap<Instance, InstanceData>,
@@ -428,6 +530,10 @@ mod rtx {
         instance_indirect: BufferProtocol,
         instance_indirect_capacity: usize,
         instance_indirect_used: usize,
+
+        per_instance_data: BufferProtocol,
+        per_instance_data_capacity: usize,
+        per_instance_data_used: usize,
 
         instance_count: BufferProtocol,
 
@@ -459,6 +565,9 @@ mod rtx {
         ) -> Self {
             Self::with_capacity(device, residency, library, 256, 4096, 16 * 1024 * 1024)
         }
+        pub fn per_instance(&self) -> MTLGPUAddress {
+            self.per_instance_data.gpuAddress()
+        }
         pub fn with_capacity(
             device: &DeviceProtocol,
             residency: &ResidencyProtocol,
@@ -485,6 +594,14 @@ mod rtx {
                 .expect("failed to make instance indirect buffer");
             let _: () = unsafe { msg_send![&*residency, addAllocation: &*instance_indirect] };
 
+            let per_instance_data = device
+                .newBufferWithLength_options(
+                    instance_capacity * mem::size_of::<PerInstanceData>(),
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("failed to make per_instance_data buffer");
+            let _: () = unsafe { msg_send![&*residency, addAllocation: &*per_instance_data] };
+
             let instance_count = device
                 .newBufferWithLength_options(32, MTLResourceOptions::StorageModeShared)
                 .expect("failed to make instance count buffer");
@@ -510,8 +627,11 @@ mod rtx {
                 bbox_capacity: geometry_capacity,
                 bbox_used: 0,
                 instance_indirect,
-                instance_indirect_capacity: geometry_capacity,
+                instance_indirect_capacity: instance_capacity,
                 instance_indirect_used: 0,
+                per_instance_data,
+                per_instance_data_capacity: instance_capacity,
+                per_instance_data_used: 0,
                 instance_count,
                 scratch,
                 scratch_offset: 0,
@@ -523,6 +643,7 @@ mod rtx {
                 functions: None,
                 rebuild: false,
                 rebuild_callback: None,
+                geometry_intersector: Default::default(),
                 resize: false,
             }
         }
@@ -543,7 +664,7 @@ mod rtx {
             self.rebuild = true;
         }
         pub fn add_instance(&mut self, descriptor: InstanceDescriptor) -> Instance {
-            let id = Instance(self.next_geometry);
+            let id = Instance(self.next_instance);
             self.next_instance += 1;
             self.pending
                 .push(PendingOp::Instance(id, PendingInstanceOp::Add(descriptor)));
@@ -611,6 +732,12 @@ mod rtx {
         pub fn protocol(&self) -> Option<&AccelerationStructureProtocol> {
             self.structure.as_ref()
         }
+        pub fn instance_data_buffer(&self) -> &BufferProtocol {
+            &self.instance_indirect
+        }
+        pub fn per_instance_data_buffer(&self) -> &BufferProtocol {
+            &self.per_instance_data
+        }
         fn build_intersect_functions(
             names: Vec<String>,
             library: &LibraryProtocol,
@@ -656,6 +783,9 @@ mod rtx {
             }
             if self.instance_indirect_used >= self.instance_indirect_capacity {
                 self.resize_instance();
+            }
+            if self.per_instance_data_used >= self.per_instance_data_capacity {
+                self.resize_per_instance_data();
             }
         }
 
@@ -709,17 +839,34 @@ mod rtx {
             }
         }
 
+        fn resize_per_instance_data(&mut self) {
+            //TODO
+        }
+
         fn rebuild_linked_functions(&mut self) {
             let sorted_geometry = self
                 .geometry
                 .keys()
                 .copied()
                 .collect::<BTreeSet<Geometry>>();
-            let sorted_geometry_names = sorted_geometry
+            let mut sorted_geometry_names = sorted_geometry
                 .into_iter()
                 .map(|x| &self.geometry[&x])
                 .map(|x| x.descriptor.func.name.clone())
                 .collect::<Vec<_>>();
+            sorted_geometry_names.dedup();
+
+            self.geometry_intersector = Default::default();
+            for (geometry, data) in &self.geometry {
+                let mut idx = None;
+                for (i, name) in sorted_geometry_names.iter().enumerate() {
+                    if name == &data.descriptor.func.name {
+                        idx = Some(i);
+                        break;
+                    }
+                }
+                self.geometry_intersector.insert(*geometry, idx.unwrap());
+            }
 
             let (functions, linked) =
                 Self::build_intersect_functions(sorted_geometry_names, &self.library);
@@ -742,7 +889,8 @@ mod rtx {
                     .expect("instance references non existant geometry");
 
                 let transform = Matrix::from_translation(data.descriptor.position)
-                    * data.descriptor.rotation.to_matrix();
+                    * data.descriptor.rotation.to_matrix()
+                    * Matrix::from_scale(data.descriptor.scale);
                 let opaque = if geometry.descriptor.opaque {
                     MTLAccelerationStructureInstanceOptions::Opaque
                 } else {
@@ -758,12 +906,10 @@ mod rtx {
                             options: opaque,
                             mask,
                             intersectionFunctionTableOffset: 0,
-                            userID: 0,
+                            userID: data.index as u32,
                             accelerationStructureID: primitive,
                         }
                 }
-
-                data.dirty = true;
             }
 
             let instance_count = self.instance.len();
@@ -803,6 +949,7 @@ mod rtx {
                 let _: () = msg_send![&*self.residency, addAllocation: &*self.bbox];
                 let _: () = msg_send![&*self.residency, addAllocation: &*self.instance_indirect];
                 let _: () = msg_send![&*self.residency, addAllocation: &*self.instance_count];
+                let _: () = msg_send![&*self.residency, addAllocation: &*self.per_instance_data];
                 let _: () = msg_send![&*self.residency, addAllocation: &*self.scratch];
 
                 self.residency.commit();
@@ -816,13 +963,12 @@ mod rtx {
         }
         fn rebuild_primitive_structures(&mut self, cmd: &CommandBufferProtocol) {
             let mut geometry = mem::take(&mut self.geometry);
-            let mut set = HashMap::new();
 
             for (geometry, mut data) in geometry
-                .into_iter()
+                .iter_mut()
                 .filter(|(_, x)| x.dirty || x.primitive.is_none())
             {
-                let intersection_function_table_offset = geometry.0;
+                let intersection_function_table_offset = self.geometry_intersector[&geometry];
 
                 let mut primitive_geometry_descriptor =
                     MTL4AccelerationStructureBoundingBoxGeometryDescriptor::init(
@@ -864,6 +1010,8 @@ mod rtx {
                     let _: () =
                         msg_send![&*self.residency, addAllocation: &*self.instance_indirect];
                     let _: () = msg_send![&*self.residency, addAllocation: &*self.instance_count];
+                    let _: () =
+                        msg_send![&*self.residency, addAllocation: &*self.per_instance_data];
                     let _: () = msg_send![&*self.residency, addAllocation: &*self.scratch];
 
                     self.residency.commit();
@@ -875,9 +1023,8 @@ mod rtx {
                 let acceleration_structure =
                     unsafe { self.build_acceleration_structure(&cmd, &primitive_descriptor) };
                 data.primitive = Some(acceleration_structure);
-                set.insert(geometry, data);
             }
-            mem::swap(&mut set, &mut self.geometry);
+            self.geometry = geometry;
         }
 
         fn add_geometry_commit(
@@ -906,10 +1053,10 @@ mod rtx {
                     primitive: None,
                     descriptor,
                     bbox_index,
-                    intersection_func_index: None,
                     dirty: true,
                 },
             );
+            self.bbox_used += 1;
         }
 
         fn remove_geometry_commit(
@@ -931,9 +1078,45 @@ mod rtx {
             if self.instance_indirect_used >= self.instance_indirect_capacity {
                 self.resize = true;
             }
+            if self.per_instance_data_used >= self.per_instance_data_capacity {
+                self.resize = true;
+            }
 
             let index = self.instance_indirect_used;
             self.instance_indirect_used += 1;
+            self.per_instance_data_used += 1;
+
+            let transform = (Matrix::from_translation(descriptor.position)
+                * descriptor.rotation.to_matrix()
+                * Matrix::from_scale(descriptor.scale));
+            let inverse_transform = transform.inverse().unwrap();
+
+            let min_4d = Vector([
+                descriptor.position[0],
+                descriptor.position[1],
+                descriptor.position[2],
+                0.0,
+            ]);
+            let size_4d = Vector([
+                descriptor.scale[0],
+                descriptor.scale[1],
+                descriptor.scale[2],
+                0.0,
+            ]);
+
+            unsafe {
+                *self
+                    .per_instance_data
+                    .contents()
+                    .cast::<PerInstanceData>()
+                    .as_ptr()
+                    .offset(index as isize) = PerInstanceData {
+                    transform,
+                    inverse_transform,
+                    min: min_4d,
+                    size: size_4d,
+                };
+            }
 
             self.instance_to_offset.insert(id, index);
             self.instance.insert(
@@ -954,6 +1137,37 @@ mod rtx {
         ) {
             if let Some(instance) = self.instance.get_mut(&id) {
                 instance.descriptor = descriptor;
+
+                let transform = (Matrix::from_translation(descriptor.position)
+                    * descriptor.rotation.to_matrix()
+                    * Matrix::from_scale(descriptor.scale));
+                let inverse_transform = transform.inverse().unwrap();
+                let min_4d = Vector([
+                    descriptor.position[0],
+                    descriptor.position[1],
+                    descriptor.position[2],
+                    0.0,
+                ]);
+                let size_4d = Vector([
+                    descriptor.scale[0],
+                    descriptor.scale[1],
+                    descriptor.scale[2],
+                    0.0,
+                ]);
+                unsafe {
+                    *self
+                        .per_instance_data
+                        .contents()
+                        .cast::<PerInstanceData>()
+                        .as_ptr()
+                        .offset(instance.index as isize) = PerInstanceData {
+                        transform,
+                        inverse_transform,
+                        min: min_4d,
+                        size: size_4d,
+                    };
+                }
+                instance.dirty = true;
             }
         }
 
@@ -1034,7 +1248,10 @@ pub struct Metal {
     argument_table: Vec<ArgumentTableProtocol>,
     argument_table2: Vec<ArgumentTableProtocol>,
     camera_buffer: Vec<BufferProtocol>,
-    upscale: RenderPipelineProtocol,
+    palette_buffer: BufferProtocol,
+    world_position_texture: Vec<TextureProtocol>,
+    world_normal_texture: Vec<TextureProtocol>,
+    shading: RenderPipelineProtocol,
     acceleration_structure: rtx::AccelerationStructure,
     raytrace: Option<ComputePipelineProtocol>,
     intersect_table: Option<IntersectionFunctionTableProtocol>,
@@ -1071,13 +1288,13 @@ impl Metal {
             .newLibraryWithSource_options_error(&source, None)
             .expect("Failed to compile shader");
 
-        let upscale = {
+        let shading = {
             let func_name = NSString::from_str("upscale_vert");
             let vertex = library
                 .newFunctionWithName(&func_name)
                 .expect("Function not found");
 
-            let func_name = NSString::from_str("upscale_frag");
+            let func_name = NSString::from_str("shade_frag");
             let fragment = library
                 .newFunctionWithName(&func_name)
                 .expect("Function not found");
@@ -1109,6 +1326,78 @@ impl Metal {
                     .unwrap()
             })
             .collect::<Vec<_>>();
+        let mut palette_data = vec![];
+        const PALETTE: &str = include_str!("colors.palette");
+        fn hex_to_rgb(hex_code: &str) -> Option<Vector<3, f32>> {
+            // Remove the '#' prefix if present
+            let hex_code = hex_code.strip_prefix('#').unwrap_or(hex_code);
+
+            // Ensure the string has the correct length (6 characters for RRGGBB)
+            if hex_code.len() != 6 {
+                return None;
+            }
+
+            // Parse each two-character segment into a u8
+            let r = u8::from_str_radix(&hex_code[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex_code[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex_code[4..6], 16).ok()?;
+
+            Some(Vector([r as f32 / 255., g as f32 / 255., b as f32 / 255.]))
+        }
+
+        pub fn rgb_to_hsv(this: Vector<3, f32>) -> Vector<3, f32> {
+            let Vector([r, g, b]) = this;
+            let max = r.max(g).max(b);
+            let min = r.min(g).min(b);
+            let delta = max - min;
+
+            // 1. Value
+            let v = max;
+
+            // 2. Saturation
+            let s = if max == 0.0 { 0.0 } else { delta / max };
+
+            // 3. Hue
+            let h = if delta == 0.0 {
+                0.0 // Grayscale
+            } else {
+                let mut hue = if max == r {
+                    ((g - b) / delta) % 6.0 // Red sector
+                } else if max == g {
+                    ((b - r) / delta) + 2.0 // Green sector
+                } else {
+                    ((r - g) / delta) + 4.0 // Blue sector
+                };
+
+                // Normalize to 0-1 range
+                hue = hue / 6.0;
+
+                // Wrap negative values
+                if hue < 0.0 {
+                    hue += 1.0;
+                }
+
+                hue
+            };
+
+            Vector([h, s, v])
+        }
+        for hex in PALETTE.lines() {
+            palette_data.push(dbg!(rgb_to_hsv(hex_to_rgb(hex).unwrap())));
+        }
+        let mut palette_data_slice = unsafe {
+            slice::from_raw_parts_mut(
+                palette_data.as_mut_ptr().cast::<u8>(),
+                mem::size_of::<Vector<3, f32>>() * palette_data.len(),
+            )
+        };
+        let palette_buffer = device
+            .newBufferWithBytes_length_options(
+                NonNull::new_unchecked(palette_data_slice.as_mut_ptr()).cast(),
+                palette_data_slice.len(),
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap();
 
         let render_size = Size::new(1280.0, 720.0);
         let texture_descriptor = MTLTextureDescriptor::new();
@@ -1125,6 +1414,24 @@ impl Metal {
                     .expect("Failed to create render texture")
             })
             .collect::<Vec<_>>();
+
+        texture_descriptor.setPixelFormat(MTLPixelFormat::RGBA32Float);
+        let world_position_texture = (0..frame_in_flight)
+            .map(|_| {
+                device
+                    .newTextureWithDescriptor(&texture_descriptor)
+                    .expect("Failed to create render texture")
+            })
+            .collect::<Vec<_>>();
+
+        let world_normal_texture = (0..frame_in_flight)
+            .map(|_| {
+                device
+                    .newTextureWithDescriptor(&texture_descriptor)
+                    .expect("Failed to create render texture")
+            })
+            .collect::<Vec<_>>();
+
         let residency_desc = MTLResidencySetDescriptor::init(MTLResidencySetDescriptor::alloc());
 
         let residency_set = device
@@ -1133,6 +1440,8 @@ impl Metal {
 
         for i in 0..frame_in_flight {
             let _: () = msg_send![&*residency_set, addAllocation: &*render_texture[i]];
+            let _: () = msg_send![&*residency_set, addAllocation: &*world_position_texture[i]];
+            let _: () = msg_send![&*residency_set, addAllocation: &*world_normal_texture[i]];
             let _: () = msg_send![&*residency_set, addAllocation: &*camera_buffer[i]];
         }
 
@@ -1162,25 +1471,68 @@ impl Metal {
         let mut acceleration_structure =
             rtx::AccelerationStructure::new(&device, &residency_set, &library);
 
+        use memvox::Volume;
+        let mut vol = memvox::MemVol::<usize>::with_capacity(0, Vector([8usize, 8, 8]));
+
+        dbg!(vol.capacity());
+        let perlin = &noise::Perlin::new(32);
+        for x in 0..8 {
+            for y in 0..8 {
+                use noise::NoiseFn;
+                let top = NoiseFn::<f64, 3>::get(&perlin, [x as f64 * 0.05, y as f64 * 0.05, 0.])
+                    as f32
+                    * 12.
+                    + 4.;
+
+                for z in 0..top as usize {
+                    vol.set(Vector([x, y, z]), 1);
+                }
+            }
+        }
+
+        let mut bounding_boxes = memvox::BoundingBox::derive(&vol, |x| *x == 1);
         let sphere = acceleration_structure.add_geometry(GeometryDescriptor {
             bounding_box: BoundingBox {
-                min: [-0.5, -0.5, -0.5],
-                max: [0.5, 0.5, 0.5],
+                min: array::from_fn(|_| EPSILON),
+                max: array::from_fn(|_| 1.0 - EPSILON),
             },
             func: rtx::IntersectionFunction {
-                name: "voxel_sphere_intersect".into(),
+                name: "voxel_intersect".into(),
             },
             opaque: false,
         });
+        for memvox::BoundingBox { size, min, .. } in bounding_boxes.into_iter() {
+            dbg!(min, size);
+            acceleration_structure.add_instance(InstanceDescriptor {
+                geometry: sphere,
+                rotation: Quaternion::IDENTITY,
+                position: Vector([min[0] as f32, min[1] as f32, min[2] as f32]),
+                scale: Vector([size[0] as f32, size[1] as f32, size[2] as f32]),
+                mask: 1,
+                user_id: 0,
+            });
+        }
 
+        let plane = acceleration_structure.add_geometry(GeometryDescriptor {
+            bounding_box: BoundingBox {
+                min: [-1000.0, -1000.0, -0.1],
+                max: [1000.0, 1000.0, 0.0],
+            },
+            func: rtx::IntersectionFunction {
+                name: "grid_intersect".into(),
+            },
+            opaque: false,
+        });
+        use math::One;
         acceleration_structure.add_instance(InstanceDescriptor {
-            geometry: sphere,
+            geometry: plane,
             rotation: Quaternion::IDENTITY,
-            position: Vector::<3, f32>::X / 2.0,
-
+            position: Vector::ZERO,
+            scale: Vector::<3, f32>::ONE,
             mask: 1,
             user_id: 0,
         });
+
         acceleration_structure.set_rebuild_callback(|accel| REBUILT = true);
 
         Self {
@@ -1199,14 +1551,17 @@ impl Metal {
             frame_event,
             argument_table,
             argument_table2,
-            upscale,
+            world_position_texture,
+            world_normal_texture,
+            shading,
             acceleration_structure,
             raytrace: None,
             intersect_table: None,
+            palette_buffer,
         }
     }
 
-    unsafe fn render(&mut self, camera: crate::CameraData) {
+    unsafe fn render(&mut self, camera: CameraData) {
         if self.frame >= self.frame_in_flight {
             let frame_to_wait = self.frame - self.frame_in_flight;
             let done: bool = msg_send![&self.frame_event, waitUntilSignaledValue:frame_to_wait, timeoutMS:10usize];
@@ -1230,10 +1585,23 @@ impl Metal {
         command_buffer.useResidencySet(&self.residency_set);
         self.acceleration_structure.update(&command_buffer);
 
+        // Bind G-Buffer textures for the compute pass
         self.argument_table[frame_index]
-            .setTexture_atIndex(self.render_texture[frame_index].gpuResourceID(), 0);
+            .setTexture_atIndex(self.world_position_texture[frame_index].gpuResourceID(), 0);
+        self.argument_table[frame_index]
+            .setTexture_atIndex(self.world_normal_texture[frame_index].gpuResourceID(), 1);
+
+        // Bind buffers for the compute pass
         self.argument_table[frame_index]
             .setAddress_atIndex(self.camera_buffer[frame_index].gpuAddress(), 0);
+        let per_instance_buffer = self.acceleration_structure.per_instance_data_buffer();
+        self.argument_table[frame_index].setAddress_atIndex(per_instance_buffer.gpuAddress(), 3);
+        self.argument_table[frame_index].setAddress_atIndex(
+            self.acceleration_structure
+                .instance_data_buffer()
+                .gpuAddress(),
+            4,
+        );
 
         if let Some(protocol) = self.acceleration_structure.protocol() {
             self.argument_table[frame_index].setResource_atBufferIndex(protocol.gpuResourceID(), 1);
@@ -1307,7 +1675,6 @@ impl Metal {
                 threads_per_threadgroup,
             );
         }
-
         encoder.barrierAfterStages_beforeQueueStages_visibilityOptions(
             MTLStages::All,
             MTLStages::Fragment,
@@ -1315,8 +1682,12 @@ impl Metal {
         );
 
         encoder.endEncoding();
+
         self.argument_table2[frame_index]
-            .setTexture_atIndex(self.render_texture[frame_index].gpuResourceID(), 0);
+            .setTexture_atIndex(self.world_position_texture[frame_index].gpuResourceID(), 2);
+        self.argument_table2[frame_index]
+            .setTexture_atIndex(self.world_normal_texture[frame_index].gpuResourceID(), 3);
+        self.argument_table2[frame_index].setAddress_atIndex(self.palette_buffer.gpuAddress(), 5);
 
         let attachment = MTLRenderPassColorAttachmentDescriptor::init(
             MTLRenderPassColorAttachmentDescriptor::alloc(),
@@ -1340,7 +1711,7 @@ impl Metal {
             &self.argument_table2[frame_index],
             MTLRenderStages::Fragment,
         );
-        render_encoder.setRenderPipelineState(&self.upscale);
+        render_encoder.setRenderPipelineState(&self.shading);
         render_encoder.setViewport(MTLViewport {
             originX: 0.0,
             originY: 0.0,
@@ -1370,8 +1741,9 @@ impl Metal {
 pub struct Darwin {
     metal: RefCell<Metal>,
     window: Rc<RefCell<Window>>,
-    camera_vel: RefCell<crate::Vector<2, f32>>,
-    camera_pos: RefCell<crate::Vector<2, f32>>,
+    camera_vel: RefCell<Vector<2, f32>>,
+    camera_pos: RefCell<Vector<2, f32>>,
+    angle_vel: RefCell<f32>,
     angle: RefCell<f32>,
     zoom_vel: RefCell<f32>,
     zoom: RefCell<f32>,
@@ -1393,15 +1765,15 @@ impl Darwin {
         Self {
             metal,
             window,
-            camera_vel: RefCell::new(crate::Vector::ZERO),
-            camera_pos: RefCell::new(crate::Vector([0.0, 0.0])),
+            camera_vel: RefCell::new(Vector::ZERO),
+            camera_pos: RefCell::new(Vector([0.0, 0.0])),
             angle: (PI / 4.0).into(),
             zoom: 0.5.into(),
+            angle_vel: 0.0.into(),
             zoom_vel: 0.0.into(),
         }
     }
-    pub fn camera_data(&self) -> crate::CameraData {
-        use crate::CameraData;
+    pub fn camera_data(&self) -> CameraData {
         let screen_size = self.metal.borrow().render_size;
         let native_scale = self.window.borrow().native_scale();
         let camera_pos = self.camera_pos.borrow();
@@ -1410,10 +1782,9 @@ impl Darwin {
             aspect: 1.0,
             near: 0.1,
         };
-        let center = crate::Vector([camera_pos[0], camera_pos[1], 0.0]); // Looking at z=0
+        let center = Vector([camera_pos[0], camera_pos[1], 0.0]); // Looking at z=0
         let distance = (self.zoom.borrow().powf(2.0) * 100.0 + 30.0).clamp(30.0, 130.0);
-        let base_direction =
-            crate::Vector([0.0, -1.0, 1.0 + 2.0 * *self.zoom.borrow()]).normalize(); // Start at 45° angle
+        let base_direction = Vector([0.0, -1.0, 1.0 + 2.0 * *self.zoom.borrow()]).normalize(); // Start at 45° angle
 
         let up = Vector::<3, f32>::Z;
         let rotation = Quaternion::from_axis_angle(up, *self.angle.borrow());
@@ -1426,7 +1797,7 @@ impl Darwin {
         for i in 0..3 {
             transform[(i, 3)] = pos[i];
         }
-        dbg!(transform);
+        dbg!(center);
         CameraData {
             projection: dbg!(projection.to_matrix()),
             projection_inverse: dbg!(projection.to_matrix().inverse().unwrap()),
@@ -1438,6 +1809,7 @@ impl Darwin {
                 native_scale as f32,
                 0.0,
             ]),
+            info: Vector([self.metal.borrow().frame as u32, 0, 0, 0]),
         }
     }
     fn pan_screen_in_world(
@@ -1457,15 +1829,19 @@ impl Darwin {
             self.window.borrow().native_scale()
         ));
 
-        use crate::{Intersect, Plane};
         let ground = Plane::Z;
-
-        Some(ground.intersect(before)? - ground.intersect(after)?)
+        dbg!(Some(ground.intersect(after)? - ground.intersect(before)?))
     }
     pub fn draw(&self) {
         let input = self.window.borrow_mut().take_input();
         for input in input {
             match input {
+                Input::Move(velocity) => {
+                    let up = Vector::<3, f32>::Z;
+                    let rotation = Quaternion::from_axis_angle(up, *self.angle.borrow());
+                    let movement = (rotation * velocity.expand(0.)) * 10.;
+                    *self.camera_vel.borrow_mut() = Vector([movement[0], movement[1]])
+                }
                 Input::Pan(screen_position, screen_velocity) => {
                     dbg!(screen_position, screen_velocity);
                     let vel = self
@@ -1474,12 +1850,16 @@ impl Darwin {
                     dbg!(vel);
                     *self.camera_vel.borrow_mut() = Vector([vel[0], vel[1]]);
                 }
+                Input::Rotate(velocity) => {
+                    *self.angle_vel.borrow_mut() = velocity;
+                }
                 Input::Zoom(zoom) => {
                     *self.zoom_vel.borrow_mut() = zoom;
                 }
             }
         }
-        *self.angle.borrow_mut() += PI / 4.0 / 60.0;
+        *self.angle.borrow_mut() += *self.angle_vel.borrow() / 60.0;
+        *self.angle_vel.borrow_mut() *= 0.8;
         *self.camera_pos.borrow_mut() += *self.camera_vel.borrow() / 60.0;
         *self.camera_vel.borrow_mut() *= 0.8;
         *self.zoom.borrow_mut() += *self.zoom_vel.borrow_mut() / 60.0;
@@ -1491,16 +1871,6 @@ impl Darwin {
     }
 }
 
-impl super::World for Darwin {
-    type Object = Structure;
-}
-impl super::Graphics for Darwin {
-    type Renderer = Renderer;
-
-    fn renderer_of(obj: <Self as super::World>::Object) -> <Self as super::Graphics>::Renderer {
-        todo!()
-    }
-}
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 pub struct Structure(usize);
 

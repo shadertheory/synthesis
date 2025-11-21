@@ -1,3 +1,15 @@
+#![feature(
+    trait_alias,
+    thread_local,
+    inherent_associated_types,
+    generic_const_exprs,
+    associated_type_defaults,
+    ptr_metadata,
+    box_as_ptr,
+    type_alias_impl_trait
+)]
+
+use derive_more::{Deref, DerefMut};
 use std::{
     cell::RefCell,
     convert::identity,
@@ -5,11 +17,48 @@ use std::{
     iter::Sum,
     mem::{self, MaybeUninit},
     ops::{BitAnd, BitOr, BitOrAssign, Deref, Index, IndexMut, Neg, Shl, Shr, *},
-    slice,
+    ptr, slice,
 };
 
 pub trait Tensor {
     type Repr;
+}
+
+pub trait Convert<Between>: Sized {
+    fn convert_to(self) -> Between;
+    fn convert_from(between: Between) -> Self;
+}
+
+impl<T: TryFrom<U>, U: TryFrom<T>> Convert<U> for T {
+    fn convert_to(self) -> U {
+        U::try_from(self).map_err(|_| ()).unwrap()
+    }
+    fn convert_from(between: U) -> Self {
+        T::try_from(between).map_err(|_| ()).unwrap()
+    }
+}
+
+use objc2_foundation::*;
+impl From<NSPoint> for Vector<2, f32> {
+    fn from(point: NSPoint) -> Self {
+        Self([point.x as f32, point.y as f32])
+    }
+}
+impl From<Matrix<4, 4, f32>> for objc2_metal::MTLPackedFloat4x3 {
+    fn from(value: Matrix<4, 4, f32>) -> Self {
+        let mut ret = unsafe { mem::zeroed::<Self>() };
+        let mut ptr = ret.columns.as_mut_ptr().cast::<f32>();
+        for col in 0..4 {
+            for row in 0..3 {
+                unsafe {
+                    *ptr = value[(row, col)];
+                    println!("{:?}", value[(row, col)]);
+                    ptr = ptr.add(1);
+                }
+            }
+        }
+        ret
+    }
 }
 
 #[repr(C)]
@@ -209,6 +258,14 @@ where
         Self(arr)
     }
 
+    pub fn from_scale(translation: Vector<{ COLS - 1 }, T>) -> Self {
+        let mut matrix = Matrix::identity();
+        for i in 0..ROWS - 1 {
+            matrix[(i, i)] = translation[i];
+        }
+        matrix
+    }
+
     pub fn from_translation(translation: Vector<{ COLS - 1 }, T>) -> Self {
         let mut matrix = Matrix::identity();
         for row in 0..ROWS - 1 {
@@ -387,6 +444,34 @@ impl Projection {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Vector<const DIM: usize, T>(pub [T; DIM]);
+
+impl<const DIM: usize, T> Vector<DIM, T> {
+    pub fn expand(self, component: T) -> Vector<{ DIM + 1 }, T> {
+        let mut this = unsafe { mem::zeroed::<Vector<{ DIM + 1 }, T>>() };
+        unsafe {
+            ptr::copy(
+                (&self as *const Self),
+                (&mut this as *mut Vector<{ DIM + 1 }, T>).cast::<Self>(),
+                1,
+            );
+        };
+        this[DIM] = component;
+        this
+    }
+}
+impl<const DIM: usize, T: Zero> Zero for Vector<DIM, T> {
+    const ZERO: Self = Self([T::ZERO; DIM]);
+}
+impl<const DIM: usize, T: One> One for Vector<DIM, T> {
+    const ONE: Self = Self([T::ONE; DIM]);
+}
+
+impl<const DIM: usize, T> Deref for Vector<DIM, T> {
+    type Target = [T; DIM];
+    fn deref(&self) -> &<Self as Deref>::Target {
+        &self.0
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct Raycast<const DIM: usize, T> {
@@ -938,30 +1023,31 @@ vector_op!(Div, div, /, /=);
 vector_op!(Rem, rem, %, %=);
 
 pub trait IndexExt<const DIM: usize>: Tensor {
-    fn to_one_dim(self, size: <Self as Tensor>::Repr) -> <Self as Tensor>::Repr;
-    fn from_one_dim(idx: <Self as Tensor>::Repr, size: <Self as Tensor>::Repr) -> Self;
+    fn to_one_dim(self, size: Vector<DIM, <Self as Tensor>::Repr>) -> <Self as Tensor>::Repr;
+    fn from_one_dim(idx: <Self as Tensor>::Repr, size: Vector<DIM, <Self as Tensor>::Repr>)
+    -> Self;
 }
 
 impl<T: Num> IndexExt<2> for Vector<2, T> {
-    fn to_one_dim(self, size: T) -> <Self as Tensor>::Repr {
+    fn to_one_dim(self, size: Vector<2, T>) -> <Self as Tensor>::Repr {
         let Self([x, y]) = self;
-        x + y * size
+        x + y * size[0]
     }
 
-    fn from_one_dim(idx: <Self as Tensor>::Repr, size: T) -> Self {
-        Self([idx % size, idx / size])
+    fn from_one_dim(idx: <Self as Tensor>::Repr, size: Vector<2, T>) -> Self {
+        Self([idx % size[0], idx / size[0]])
     }
 }
 
 impl<T: Num> IndexExt<3> for Vector<3, T> {
-    fn to_one_dim(self, size: T) -> <Self as Tensor>::Repr {
-        let Self([x, y, z]) = self;
-        x + size * (y + z * size)
+    fn to_one_dim(self, cap: Vector<3, T>) -> T {
+        self.0[0] + (self.0[1] * cap.0[0]) + (self.0[2] * cap.0[0] * cap.0[1])
     }
-    fn from_one_dim(idx: <Self as Tensor>::Repr, size: T) -> Self {
-        let plane_size = size * size;
-        let z = idx / plane_size;
-        let plane = idx - z * plane_size;
-        Vector([plane % size, plane / size, z])
+
+    fn from_one_dim(i: T, cap: Vector<3, T>) -> Self {
+        let x = i % cap.0[0];
+        let y = (i / cap.0[0]) % cap.0[1];
+        let z = i / (cap.0[0] * cap.0[1]);
+        Vector([x, y, z])
     }
 }

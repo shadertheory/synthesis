@@ -12,6 +12,7 @@
 		D6D49FE42E9D75F500C2FF20 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = D6D49FDE2E9D75F500C2FF20 /* Assets.xcassets */; };
 		D6D49FE52E9D75F500C2FF20 /* Renderer.m in Sources */ = {isa = PBXBuildFile; fileRef = D6D49FE02E9D75F500C2FF20 /* Renderer.m */; };
 		D6D49FE62E9D75F500C2FF20 /* Shaders.metal in Sources */ = {isa = PBXBuildFile; fileRef = D6D49FE12E9D75F500C2FF20 /* Shaders.metal */; };
+		D6F6AB5D2ED1009A00EF949D /* GameController.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D6F6AB5C2ED1009A00EF949D /* GameController.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -49,6 +50,7 @@
 		D6D49FE02E9D75F500C2FF20 /* Renderer.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = Renderer.m; sourceTree = "<group>"; };
 		D6D49FE12E9D75F500C2FF20 /* Shaders.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Shaders.metal; sourceTree = "<group>"; };
 		D6D49FE22E9D75F500C2FF20 /* ShaderTypes.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ShaderTypes.h; sourceTree = "<group>"; };
+		D6F6AB5C2ED1009A00EF949D /* GameController.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = GameController.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS26.1.sdk/System/Library/Frameworks/GameController.framework; sourceTree = DEVELOPER_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -57,6 +59,7 @@
 			membershipExceptions = (
 				"/Localized: LaunchScreen.storyboard",
 				"/Localized: Main.storyboard",
+				Info.plist,
 			);
 			target = D6D49F992E9D757100C2FF20 /* iOS */;
 		};
@@ -99,6 +102,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				D6F6AB5D2ED1009A00EF949D /* GameController.framework in Frameworks */,
 				D69DBD302E9D8171004579CF /* libengine.a in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -155,6 +159,7 @@
 		D663F7E72E97BA9F00A228C9 /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
+				D6F6AB5C2ED1009A00EF949D /* GameController.framework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -492,7 +497,9 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = NLGCJ4P7AL;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = iOS/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Synthesis;
+				INFOPLIST_KEY_GCSupportsControllerUserInteraction = YES;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.simulation-games";
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
@@ -528,7 +535,9 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = NLGCJ4P7AL;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = iOS/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Synthesis;
+				INFOPLIST_KEY_GCSupportsControllerUserInteraction = YES;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.simulation-games";
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;

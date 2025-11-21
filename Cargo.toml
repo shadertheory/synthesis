@@ -1,2 +1,2 @@
 [workspace]
-members = ["synthesis", "engine"]
+members = ["synthesis", "engine", "memvox", "math"]

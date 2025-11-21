@@ -1,0 +1,15 @@
+[package]
+name = "math"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+derive_more = { version = "2.0.1", features = ["full"] }
+paste = "1.0.15"
+objc2 = "*"
+objc2-core-graphics = "0.3.2"
+objc2-foundation = "0.3.2"
+objc2-metal = "0.3.2"
+objc2-metal-kit = "0.3.2"
+objc2-quartz-core = "0.3.2"
+objc2-ui-kit = "0.3.2"
