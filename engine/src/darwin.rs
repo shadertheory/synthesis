@@ -20,6 +20,7 @@ use objc2_quartz_core::*;
 use objc2_ui_kit::*;
 use rand::Rng;
 
+use crate::acoustics::Acoustics;
 use crate::darwin::rtx::{BoundingBox, GeometryDescriptor, InstanceDescriptor};
 use math::*;
 
@@ -1255,6 +1256,7 @@ pub struct Metal {
     acceleration_structure: rtx::AccelerationStructure,
     raytrace: Option<ComputePipelineProtocol>,
     intersect_table: Option<IntersectionFunctionTableProtocol>,
+    acoustics: Acoustics,
 }
 
 impl Metal {
@@ -1535,6 +1537,8 @@ impl Metal {
 
         acceleration_structure.set_rebuild_callback(|accel| REBUILT = true);
 
+        let acoustics = Acoustics::init(&device, &library, &residency_set, &acceleration_structure);
+
         Self {
             frame: 0,
             frame_in_flight,
@@ -1558,6 +1562,7 @@ impl Metal {
             raytrace: None,
             intersect_table: None,
             palette_buffer,
+            acoustics,
         }
     }
 
@@ -1675,6 +1680,7 @@ impl Metal {
                 threads_per_threadgroup,
             );
         }
+        let probes = self.acoustics.probe(device, encoder);
         encoder.barrierAfterStages_beforeQueueStages_visibilityOptions(
             MTLStages::All,
             MTLStages::Fragment,

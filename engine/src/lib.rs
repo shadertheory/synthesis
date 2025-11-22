@@ -10,6 +10,7 @@
     random
 )]
 
+mod acoustics;
 mod darwin;
 mod world;
 
