@@ -1,30 +1,45 @@
+use core::slice;
+use objc2::{rc::*, runtime::*, *};
+use objc2_av_foundation::*;
+use objc2_avf_audio::*;
+use objc2_core_audio_types::*;
+use objc2_core_graphics::*;
+use objc2_foundation::*;
+use objc2_game_controller::GCController;
+use objc2_metal::*;
+use objc2_metal_kit::*;
+use objc2_quartz_core::*;
+use objc2_ui_kit::*;
 use std::{
-    cell::UnsafeCell,
-    collections::HashMap,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    f32::consts::PI,
+    ops::{Deref, DerefMut},
+    ptr::{self, NonNull},
+    sync::{Arc, Mutex},
+    time::Duration,
 };
 
+use crate::darwin::{
+    CommandBufferProtocol, ComputePipelineProtocol, DeviceProtocol, LibraryProtocol,
+    ResidencyProtocol,
+};
+use block2::{Block, RcBlock};
 use math::*;
-use objc2::AnyThread;
+use objc2::rc::Retained;
 use objc2_avf_audio::{
     AVAudioEngine, AVAudioFormat, AVAudioPCMBuffer, AVAudioSession, AVAudioSessionCategoryAmbient,
     AVAudioTime,
 };
 use objc2_foundation::NSString;
-use objc2_metal::{
-    MTL4ComputeCommandEncoder, MTLComputePipelineDescriptor, MTLLibrary, MTLResourceOptions,
-};
-
-use crate::darwin::{
-    BufferProtocol, CommandBufferProtocol, ComputePipelineProtocol, DeviceProtocol,
-    FunctionProtocol, LibraryProtocol,
-};
+use objc2_metal::{MTLComputePipelineDescriptor, MTLResourceOptions};
+use std::mem;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Source {
+    id: u32,
     position: Vector<3, f32>,
     volume: f32,
+    occlusion: f32,
 }
 
 #[repr(C)]
@@ -53,36 +68,35 @@ pub struct Visualizer {
 }
 
 pub struct Acoustics {
-    sources: HashMap<u64, Source>,
+    sources: Vec<Source>,
     listener: Option<Listener>,
+    probe: Probe,
 
     scan: ComputePipelineProtocol,
     occlusion: ComputePipelineProtocol,
     visualizer: ComputePipelineProtocol,
 
-    listener_data: BufferProtocol,
-    source_data: BufferProtocol,
-    probe_data: BufferProtocol,
-    visualization_data: BufferProtocol,
+    listener_data: Vec<BufferProtocol>,
+    source_data: Vec<BufferProtocol>,
+    probe_data: Vec<BufferProtocol>,
+    visualization_data: Vec<BufferProtocol>,
 }
 
 impl Acoustics {
     pub unsafe fn init(
-        device: &Device,
+        in_flight: usize,
+        device: &DeviceProtocol,
         library: &LibraryProtocol,
-        residency: &ResidencyProtocol,
-        structure: &AccelerationStructure,
-    ) {
+    ) -> Self {
         let max_sources = 64;
         let max_dots = 100;
         let max_probes = 1000;
 
-        let linked = structure.linked().unwrap();
-
-        let make_pipeline = |func| {
+        let make_pipeline = |func: &str| {
             let desc = MTLComputePipelineDescriptor::new();
-            desc.setComputeFunction(library.newFunctionWithName(&NSString::from_str(func)));
-            desc.setLinkedFunctions(Some(&*linked));
+            let name = NSString::from_str(func);
+            let function = library.newFunctionWithName(&name).unwrap();
+            desc.setComputeFunction(Some(&function));
             device
                 .newComputePipelineStateWithDescriptor_options_reflection_error(
                     &desc,
@@ -93,17 +107,19 @@ impl Acoustics {
         };
 
         let make_buf = |len| {
-            device.newBufferWithLength_options(len as u64, MTLResourceOptions::StorageModeShared)
+            device
+                .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
+                .unwrap()
         };
 
-        let scan = (make_pipeline)("scan");
-        let occlusion = (make_pipeline)("occlude");
-        let visualizer = (make_pipeline)("visualize");
+        let scan = make_pipeline("scan");
+        let occlusion = make_pipeline("occlude");
+        let visualizer = make_pipeline("visualize");
 
-        let listener_data = (make_buf)(mem::size_of::<Listener>());
-        let source_data = (make_buf)(max_sources * mem::size_of::<Source>());
-        let probe_data = (make_buf)(max_probes * mem::size_of::<Probe>());
-        let visualization_data = (make_buf)(max_dots * mem::size_of::<Visualizer>());
+        let listener_data = vec![make_buf(mem::size_of::<Listener>()); in_flight];
+        let source_data = vec![make_buf(max_sources * mem::size_of::<Source>()), in_flight];
+        let probe_data = vec![make_buf(max_probes * mem::size_of::<Probe>()), in_flight];
+        let visualization_data = vec![make_buf(max_dots * mem::size_of::<Visualizer>()), in_flight];
 
         Self {
             scan,
@@ -114,95 +130,207 @@ impl Acoustics {
             probe_data,
             visualization_data,
             listener: None,
+            probe: Default::default(),
             sources: Default::default(),
         }
     }
 
-    pub unsafe fn probe(device: &DeviceProtocol, cmd: &CommandBufferProtocol) -> Probe {}
-}
+    pub unsafe fn dispatch(&mut self, cmd: &CommandBufferProtocol, residency: &ResidencyProtocol) {
+        let enc = cmd.computeCommandEncoder().unwrap();
 
-pub trait Audio {
-    fn left(&self) -> &[f32];
-    fn right(&self) -> &[f32];
-    fn position(&self) -> usize;
-    fn volume(&self) -> f32;
-    fn repeat(&self) -> bool;
-    fn play(&self) -> bool;
+        enc.setComputePipelineState(&self.scan);
+        let one = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        enc.dispatchThreads_threadsPerThreadgroup(one, one);
+
+        enc.setComputePipelineState(&self.occlusion);
+        enc.dispatchThreads_threadsPerThreadgroup(MTLSize, threads_per_threadgroup);
+    }
+
+    pub unsafe fn readback(&mut self, ring: usize) {
+        let probe_data = &mut self.probe_data[ring];
+        let source_data = &mut self.source_data[ring];
+
+        let probe_count = *probe_data.contents().cast::<u32>();
+        let probe_ptr = probe_data
+            .contents()
+            .byte_add(mem::size_of::<u32>())
+            .cast::<probe>();
+        let probe = (0..probe_count).map(|x| probe_ptr[x]).sum() / probe_count;
+
+        self.probe(probe);
+
+        let source_count = *source_data.contents().cast::<u32>();
+        let source_ptr = source_data
+            .contents()
+            .byte_add(mem::size_of::<u32>())
+            .cast::<Source>();
+        let sources = slice::from_raw_parts::<Source>(source_ptr, source_count);
+
+        for gpu in sources {
+            let Ok(cpu_idx) = self.sources.binary_search_by_key(gpu.id, |src| src.id) else {
+                continue;
+            };
+
+            self.sources[cpu_idx].occlusion = gpu.occlusion;
+        }
+    }
+
+    pub unsafe fn upload(&mut self, ring: usize) -> bool {
+        let source_count = self.sources.len();
+        if source_count == 0 {
+            return false;
+        }
+        let listener_data = &mut self.listener_data[ring];
+        let source_data = &mut self.source_data[ring];
+
+        ptr::copy_nonoverlapping(&self.listener, &mut *listener_data.contents().cast(), 1);
+        ptr::copy_nonoverlapping(
+            self.sources.as_ptr(),
+            &mut *source_data.contents().cast(),
+            source_count,
+        );
+
+        return true;
+    }
+
+    pub unsafe fn update(
+        &mut self,
+        frame: usize,
+        in_flight: usize,
+        engine: &Engine,
+        cmd: &CommandBufferProtocol,
+        residency: &ResidencyProtocol,
+    ) {
+        let idx = frame % in_flight;
+        if frame >= in_flight {
+            self.readback(idx);
+        }
+        if self.upload(idx) {
+            self.dispatch(cmd, residency);
+        }
+        engine.apply(probe);
+    }
+
+    pub unsafe fn probe(&mut self, probe: Probe) {
+        self.probe = probe;
+    }
+}
+pub trait Audio: Send + Sync {
     fn render(&self, sample_rate: f32, left: &mut [f32], right: &mut [f32]);
 }
 
-pub type Driver = Retained<AVAudioEngine>;
-pub type AudioMap = Arc<UnsafeCell<HashMap<u64, Arc<dyn Audio>>>>;
+use std::collections::HashMap;
+
+pub type AudioMap = Arc<Mutex<HashMap<u64, Arc<dyn Audio>>>>;
 
 pub struct Engine {
-    driver: Driver,
+    _driver: Retained<AVAudioEngine>,
     audio: AudioMap,
     next: u64,
-    sample_rate: f64,
+    pub sample_rate: f32,
 }
 
 impl Engine {
     pub unsafe fn init() -> Result<Self, ()> {
         let session = AVAudioSession::sharedInstance();
-        session.setCategory_error(AVAudioSessionCategoryAmbient);
-        session.setActive_error(true);
+        let _ = session.setCategory_error(AVAudioSessionCategoryAmbient.unwrap());
+
+        let _ = session.setActive_error(true);
 
         let driver = AVAudioEngine::new();
-        let output_format = driver.outputNode().outputFormatForBus(0);
-        let sample_rate = output_format.sampleRate();
+        let output_node = driver.outputNode();
+        let output_format = output_node.outputFormatForBus(0);
+        let sample_rate = output_format.sampleRate() as f32;
 
-        let format = AVAudioFormat::initStandardFormatWithSampleRate_channels(
-            AVAudioFormat::alloc(),
-            sample_rate,
-            2,
-        );
-        let sample_rate = sample_rate as f32;
+        let audio_map: AudioMap = Arc::new(Mutex::new(HashMap::new()));
+        let block_audio_map = audio_map.clone();
 
-        let audio = Arc::new(UnsafeCell::new(HashMap::new()));
+        let renderer = RcBlock::new(
+            move |_is_silence: NonNull<Bool>,
+                  _timestamp: NonNull<AudioTimeStamp>,
+                  frame_count: u32,
+                  mut output_data: NonNull<AudioBufferList>| {
+                let buffer = unsafe { output_data.as_mut() };
 
-        let sources = audio.clone();
-        let block = Block::new(
-            move |silent: *mut bool,
-                  timestamp: *const AVAudioTime,
-                  frames: u32,
-                  output: *mut AVAudioPCMBuffer| {
-                unsafe {
-                    let silent = silent.as_mut().unwrap();
-                    let buffer = &*output;
-                    let channel_count = buffer.format().channelCount();
-                    if channel_count < 2 {
-                        return -1;
+                let buffers = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        buffer.mBuffers.as_mut_ptr(),
+                        buffer.mNumberBuffers as usize,
+                    )
+                };
+
+                if buffers.len() < 2 {
+                    // We're expecting stereo, but didn't get it.
+                    // Fill what we got with silence and return.
+                    for buf in buffers {
+                        if !buf.mData.is_null() {
+                            unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    buf.mData as *mut u8,
+                                    buf.mDataByteSize as usize,
+                                )
+                                .fill(0)
+                            };
+                        }
                     }
+                    return 0;
+                }
 
-                    // Get the float channel data pointer
-                    let channel_data = buffer.floatChannelData();
-                    if channel_data.is_null() {
-                        return -1;
-                    }
+                let left_slice = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        buffers[0].mData as *mut f32,
+                        frame_count as usize,
+                    )
+                };
+                let right_slice = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        buffers[1].mData as *mut f32,
+                        frame_count as usize,
+                    )
+                };
 
-                    // Access left and right channels
-                    let channels = std::slice::from_raw_parts(channel_data.cast::<*mut f32>(), 2);
-                    let left_buffer =
-                        std::slice::from_raw_parts_mut(channels[0], frame_count as usize);
-                    let right_buffer =
-                        std::slice::from_raw_parts_mut(channels[1], frame_count as usize);
+                left_slice.fill(0.0);
+                right_slice.fill(0.0);
 
-                    left_buffer.fill(0.0);
-                    right_buffer.fill(0.0);
-
-                    for audio in audio.values() {
-                        sources.render(left, right, sample_rate);
+                if let Ok(map) = block_audio_map.lock() {
+                    for source in map.values() {
+                        source.render(sample_rate, left_slice, right_slice);
                     }
                 }
+
+                0
             },
         );
 
-        Self {
-            driver,
-            audio,
+        let source_node = objc2_avf_audio::AVAudioSourceNode::initWithRenderBlock(
+            objc2_avf_audio::AVAudioSourceNode::alloc(),
+            RcBlock::as_ptr(&renderer),
+        );
+
+        driver.attachNode(&source_node);
+        let format = AVAudioFormat::initStandardFormatWithSampleRate_channels(
+            AVAudioFormat::alloc(),
+            output_format.sampleRate(),
+            2, tf
+        )
+        .unwrap();
+        driver.connect_to_format(&source_node, &output_node, Some(&format));
+
+        if let Err(e) = driver.startAndReturnError() {
+            println!("Failed to start engine: {:?}", e);
+            return Err(());
+        }
+
+        Ok(Self {
+            _driver: driver,
+            audio: audio_map,
             next: 0,
             sample_rate,
-        }
+        })
     }
 }
 
@@ -261,6 +389,12 @@ impl Normalized {
 
     pub fn value(&self) -> f32 {
         self.0
+    }
+}
+impl Deref for Normalized {
+    type Target = f32;
+    fn deref(&self) -> &<Self as Deref>::Target {
+        &self.0
     }
 }
 
@@ -395,6 +529,9 @@ impl Note {
     pub fn with_accidental_octave(self, accidental: Accidental, octave: Octave) -> Frequency {
         Frequency::note_accidental_octave(self, accidental, octave)
     }
+    pub fn octave(&self, octave: u8) -> Frequency {
+        Frequency::note_accidental_octave(*self, Accidental::Natural, Octave::new(octave))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -403,62 +540,173 @@ pub enum Waveform {
     Square,
     Saw,
     Triangle,
-    Noise,
 }
 
 impl Waveform {
-    /// Sample waveform at given phase [0.0, 1.0] -> [-1.0, 1.0]
-    pub fn sample(&self, phase: f32) -> f32 {
+    fn sample(&self, phase: f32) -> f32 {
         match self {
-            Waveform::Sine => (phase * std::f32::consts::TAU).sin(),
+            Waveform::Sine => (phase * 2.0 * PI).sin(),
             Waveform::Square => {
-                if phase % 1.0 < 0.5 {
+                if phase < 0.5 {
                     1.0
                 } else {
                     -1.0
                 }
             }
-            Waveform::Saw => 2.0 * (phase % 1.0) - 1.0,
+            Waveform::Saw => 2.0 * phase - 1.0,
             Waveform::Triangle => {
-                let p = phase % 1.0;
-                if p < 0.5 {
-                    4.0 * p - 1.0
+                if phase < 0.5 {
+                    4.0 * phase - 1.0
                 } else {
-                    3.0 - 4.0 * p
+                    3.0 - 4.0 * phase
                 }
             }
-            Waveform::Noise => (UNIX_EPOCH
-                .duration_since(SystemTime::now())
-                .unwrap()
-                .as_nanos() as f32)
-                .sin(),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct Envelope {
-    pub attack: Duration,    // seconds
-    pub decay: Duration,     // seconds
-    pub release: Duration,   // seconds
-    pub sustain: Normalized, // 0.0 to 1.0
+    pub attack: f32,  // seconds
+    pub decay: f32,   // seconds
+    pub sustain: f32, // 0.0 to 1.0
+    pub release: f32, // seconds
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct Voice {
-    frequency: Frequency,
+struct Voice {
+    freq: f32,
     phase: f32,
-    start: Instant,
-    release: Option<Instant>,
     waveform: Waveform,
     envelope: Envelope,
-    volume: Normalized,
-    pan: Bipolar, // -1.0 (left) to 1.0 (right)
+    samples_processed: u64,
+    released_at_sample: Option<u64>,
+    active: bool,
+    velocity: f32,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct Synthesizer {
+impl Voice {
+    fn new(freq: f32, waveform: Waveform, envelope: Envelope) -> Self {
+        Self {
+            freq,
+            phase: 0.0,
+            waveform,
+            envelope,
+            samples_processed: 0,
+            released_at_sample: None,
+            active: true,
+            velocity: 1.0,
+        }
+    }
+
+    fn render(&mut self, sample_rate: f32) -> f32 {
+        if !self.active {
+            return 0.0;
+        }
+
+        let t = self.samples_processed as f32 / sample_rate;
+        let amp = if t < self.envelope.attack {
+            t / self.envelope.attack
+        } else if t < self.envelope.attack + self.envelope.decay {
+            1.0 - ((t - self.envelope.attack) / self.envelope.decay) * (1.0 - self.envelope.sustain)
+        } else {
+            self.envelope.sustain
+        };
+
+        let final_amp = if let Some(release_sample) = self.released_at_sample {
+            let t_rel = (self.samples_processed - release_sample) as f32 / sample_rate;
+            if t_rel >= self.envelope.release {
+                self.active = false;
+                0.0
+            } else {
+                amp * (1.0 - (t_rel / self.envelope.release))
+            }
+        } else {
+            amp
+        };
+
+        let sample = self.waveform.sample(self.phase);
+        self.phase = (self.phase + self.freq / sample_rate) % 1.0;
+        self.samples_processed += 1;
+        sample * final_amp * self.velocity
+    }
+}
+
+#[derive(Debug)]
+struct SynthState {
     voices: Vec<Voice>,
-    volume: Normalized,
-    polyphony: usize,
+    volume: f32,
+}
+
+pub struct Synthesizer {
+    state: Mutex<SynthState>,
+}
+
+impl Synthesizer {
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(SynthState {
+                voices: Vec::with_capacity(32),
+                volume: 0.5,
+            }),
+        }
+    }
+
+    pub fn note_on(&self, freq: Frequency, wave: Waveform, env: Envelope) {
+        let hz = freq.hz();
+        if let Ok(mut state) = self.state.lock() {
+            state.voices.push(Voice::new(hz, wave, env));
+        }
+    }
+
+    pub fn note_off(&self, freq: Frequency) {
+        let hz = freq.hz();
+        if let Ok(mut state) = self.state.lock() {
+            for voice in state
+                .voices
+                .iter_mut()
+                .filter(|v| v.active && v.released_at_sample.is_none())
+            {
+                if (voice.freq - hz).abs() < 0.1 {
+                    voice.released_at_sample = Some(voice.samples_processed);
+                }
+            }
+        }
+    }
+}
+
+impl Audio for Synthesizer {
+    fn render(&self, sample_rate: f32, left: &mut [f32], right: &mut [f32]) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.voices.retain(|v| v.active);
+
+        for i in 0..left.len() {
+            let mut mix = 0.0;
+            for voice in &mut state.voices {
+                mix += voice.render(sample_rate);
+            }
+            mix *= state.volume;
+            left[i] += mix;
+            right[i] += mix;
+        }
+    }
+}
+
+use crate::darwin::BufferProtocol;
+impl Engine {
+    pub fn add_source(&mut self, source: Arc<dyn Audio>) -> u64 {
+        let id = self.next;
+        self.next += 1;
+        if let Ok(mut map) = self.audio.lock() {
+            map.insert(id, source);
+        }
+        id
+    }
+    pub fn remove_source(&mut self, id: u64) {
+        if let Ok(mut map) = self.audio.lock() {
+            map.remove(&id);
+        }
+    }
 }

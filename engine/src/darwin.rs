@@ -5,6 +5,7 @@ use std::f32::consts::PI;
 use std::random;
 use std::random::DefaultRandomSource;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 use std::{cell::RefCell, ptr::NonNull};
 use std::{mem, ptr, thread};
@@ -20,7 +21,7 @@ use objc2_quartz_core::*;
 use objc2_ui_kit::*;
 use rand::Rng;
 
-use crate::acoustics::Acoustics;
+use crate::acoustics::*;
 use crate::darwin::rtx::{BoundingBox, GeometryDescriptor, InstanceDescriptor};
 use math::*;
 
@@ -1265,6 +1266,34 @@ impl Metal {
         next_texture: Box<dyn Fn() -> (TextureProtocol, Size)>,
         next_present: Box<dyn Fn(&mut Metal)>,
     ) -> Self {
+        let mut engine = Engine::init().unwrap();
+
+        // 1. Create the synth
+        let synth = Arc::new(Synthesizer::new());
+
+        // 2. Register it with the engine (Engine holds one Arc)
+        engine.add_source(synth.clone());
+
+        // 3. Sequencer Logic (Main Thread)
+        // We use the local Arc 'synth' to control the sound.
+        let env = Envelope {
+            attack: 0.01,
+            decay: 0.1,
+            sustain: 0.5,
+            release: 0.2,
+        };
+
+        synth.note_on(
+            Note::C.octave(5),
+            Waveform::Sine,
+            Envelope {
+                attack: 0.1,
+                decay: 0.5,
+                sustain: 0.3,
+                release: 0.2,
+            },
+        );
+        std::thread::sleep_ms(10000);
         let frame_in_flight = 3;
 
         let next_present = Some(next_present);
@@ -1537,7 +1566,7 @@ impl Metal {
 
         acceleration_structure.set_rebuild_callback(|accel| REBUILT = true);
 
-        let acoustics = Acoustics::init(&device, &library, &residency_set, &acceleration_structure);
+        let acoustics = unsafe { mem::zeroed() }; //::init(&device, &library);
 
         Self {
             frame: 0,
@@ -1680,7 +1709,7 @@ impl Metal {
                 threads_per_threadgroup,
             );
         }
-        let probes = self.acoustics.probe(device, encoder);
+        let probes = self.acoustics.probe(&self.device, &command_buffer);
         encoder.barrierAfterStages_beforeQueueStages_visibilityOptions(
             MTLStages::All,
             MTLStages::Fragment,

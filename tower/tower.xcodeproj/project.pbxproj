@@ -9,6 +9,8 @@
 /* Begin PBXBuildFile section */
 		D68CDCDE2EA06D720082C423 /* lib.rs in Resources */ = {isa = PBXBuildFile; fileRef = D68CDCDD2EA06D720082C423 /* lib.rs */; };
 		D69DBD302E9D8171004579CF /* libengine.a in Frameworks */ = {isa = PBXBuildFile; fileRef = D69DBD2F2E9D8141004579CF /* libengine.a */; };
+		D6A91CD52ED23093001CB5B4 /* AVFAudio.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D6A91CD22ED23093001CB5B4 /* AVFAudio.framework */; };
+		D6A91CD62ED23093001CB5B4 /* AVFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D6A91CD42ED23093001CB5B4 /* AVFoundation.framework */; };
 		D6D49FE42E9D75F500C2FF20 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = D6D49FDE2E9D75F500C2FF20 /* Assets.xcassets */; };
 		D6D49FE52E9D75F500C2FF20 /* Renderer.m in Sources */ = {isa = PBXBuildFile; fileRef = D6D49FE02E9D75F500C2FF20 /* Renderer.m */; };
 		D6D49FE62E9D75F500C2FF20 /* Shaders.metal in Sources */ = {isa = PBXBuildFile; fileRef = D6D49FE12E9D75F500C2FF20 /* Shaders.metal */; };
@@ -42,6 +44,8 @@
 /* Begin PBXFileReference section */
 		D663F7DF2E97BA9000A228C9 /* engine.xcodeproj */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.pb-project"; name = engine.xcodeproj; path = ../engine/engine.xcodeproj; sourceTree = SOURCE_ROOT; };
 		D68CDCDD2EA06D720082C423 /* lib.rs */ = {isa = PBXFileReference; lastKnownFileType = text; path = lib.rs; sourceTree = "<group>"; };
+		D6A91CD22ED23093001CB5B4 /* AVFAudio.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFAudio.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS26.1.sdk/System/Library/Frameworks/AVFAudio.framework; sourceTree = DEVELOPER_DIR; };
+		D6A91CD42ED23093001CB5B4 /* AVFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFoundation.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS26.1.sdk/System/Library/Frameworks/AVFoundation.framework; sourceTree = DEVELOPER_DIR; };
 		D6D49F9A2E9D757100C2FF20 /* iOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = iOS.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		D6D49FB12E9D757200C2FF20 /* iOSTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = iOSTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		D6D49FBB2E9D757200C2FF20 /* iOSUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = iOSUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -102,6 +106,8 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				D6A91CD52ED23093001CB5B4 /* AVFAudio.framework in Frameworks */,
+				D6A91CD62ED23093001CB5B4 /* AVFoundation.framework in Frameworks */,
 				D6F6AB5D2ED1009A00EF949D /* GameController.framework in Frameworks */,
 				D69DBD302E9D8171004579CF /* libengine.a in Frameworks */,
 			);
@@ -159,6 +165,8 @@
 		D663F7E72E97BA9F00A228C9 /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
+				D6A91CD22ED23093001CB5B4 /* AVFAudio.framework */,
+				D6A91CD42ED23093001CB5B4 /* AVFoundation.framework */,
 				D6F6AB5C2ED1009A00EF949D /* GameController.framework */,
 			);
 			name = Frameworks;
@@ -255,7 +263,7 @@
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
 				LastSwiftUpdateCheck = 1620;
-				LastUpgradeCheck = 1620;
+				LastUpgradeCheck = 2610;
 				TargetAttributes = {
 					D6D49F992E9D757100C2FF20 = {
 						CreatedOnToolsVersion = 16.2;
@@ -407,7 +415,9 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
+				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = NLGCJ4P7AL;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -431,6 +441,7 @@
 				MTL_FAST_MATH = YES;
 				MTL_LANGUAGE_REVISION = Metal40;
 				ONLY_ACTIVE_ARCH = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 			};
 			name = Debug;
 		};
@@ -468,7 +479,9 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
+				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = NLGCJ4P7AL;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -485,6 +498,7 @@
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				MTL_LANGUAGE_REVISION = Metal40;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 			};
 			name = Release;
 		};
@@ -495,7 +509,6 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = NLGCJ4P7AL;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = iOS/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Synthesis;
@@ -533,7 +546,6 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = NLGCJ4P7AL;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = iOS/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Synthesis;
@@ -570,7 +582,6 @@
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = NLGCJ4P7AL;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.2;
 				MARKETING_VERSION = 1.0;
@@ -592,7 +603,6 @@
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = NLGCJ4P7AL;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.2;
 				MARKETING_VERSION = 1.0;
@@ -613,7 +623,6 @@
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = NLGCJ4P7AL;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.2;
 				MARKETING_VERSION = 1.0;
@@ -634,7 +643,6 @@
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = NLGCJ4P7AL;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.2;
 				MARKETING_VERSION = 1.0;
