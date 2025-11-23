@@ -1,15 +1,6 @@
-#include <metal_stdlib>
-#include <metal_raytracing>
+#include "raytrace.metal"
+#include "camera.metal"
 using namespace metal;
-using namespace raytracing;
-struct CameraData {
-    float4x4 projection;
-    float4x4 projection_inverse;
-    float4x4 view;
-    float4x4 transform;
-    float4 resolution;
-    uint4 info;
-};
 
 struct PerInstanceData {
     float4x4 transform;
@@ -17,114 +8,10 @@ struct PerInstanceData {
 };
 
 // Manual derivative functions for compute shaders
-struct RasterizerData
-{
-    float4 position [[position]];
-    float4 color;
-    float2 uv;  // Add UV coordinate
-};
-vertex RasterizerData
-upscale_vert(uint id [[vertex_id]])
-{
-    RasterizerData out;
-    float2 uv = float2((id << 1) & 2, id & 2);
-    out.position = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);   
-    out.color = float4(1, 0, 1, 1);
-    out.uv = uv;  // Pass UV directly (already 0-1)
-    return out;
-}
+
 
 // --- MAIN FRAGMENT SHADER ---
 
-constant uint PALETTE_SIZE = 64;
-
-// Tunable Weights for your specific "Grass stays Green" requirement
-// Hue is weighted massively so the shader prefers a Dark Green over a Dark Blue
-// even if the Blue is mathematically closer in Euclidean RGB space.
-constant float3 WEIGHTS = float3(40.0, 20.0, 10.0);
-float3 rgb2hsv(float3 c) {
-    float4 K = float4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
-    float4 p = mix(float4(c.bg, K.wz), float4(c.gb, K.xy), step(c.b, c.g));
-    float4 q = mix(float4(p.xyw, c.r), float4(c.r, p.yzx), step(p.x, c.r));
-
-    float d = q.x - min(q.w, q.y);
-    float e = 1.0e-10;
-    return float3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
-}
-inline float3 hsv2rgb(float3 c) {
-    // K stores the offsets for R, G, B phases and the math constants
-    float4 K = float4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
-    
-    // 1. Vectorized Hue calculation (R, G, B calculated at once)
-    // "fract" handles the wrapping (mod 1.0) automatically
-    float3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
-    
-    // 2. Apply Saturation and Value using mix (lerp) and clamp
-    // saturate() is a free intrinsic on Metal (clamp 0.0 to 1.0)
-    return c.z * mix(K.xxx, saturate(p - K.xxx), c.y);
-}
-fragment float4 shade_frag(RasterizerData in [[stage_in]],
-        constant float3* palettes [[buffer(5)]],
-        texture2d<float, access::read> world_position [[texture(2)]],
-        texture2d<float, access::read> world_normal [[texture(3)]],
-        texture2d<float, access::read> scratch [[texture(0)]]) 
-{    
-    // 1. Standard G-Buffer Read
-    float2 inputSize = float2(world_normal.get_width(), world_normal.get_height());
-    uint2 coord = uint2(in.uv * inputSize);
-    
-    float3 normal = world_normal.read(coord).xyz;    
-
-    // Background check
-    float3 lit_color = float3(0.1, 0.1, 0.2); 
-    if (any(normal != float3(0.0))) {        
-        
-        // Note: Replace this hardcoded pink with your voxel albedo texture read
-        float3 voxel_albedo = float3(0.2, 1.0, 0.2); 
-        lit_color = voxel_albedo;
-    }   
-
-    float3 target_hsv = rgb2hsv(lit_color);
-    float min_dist_sq = 1e9; 
-    float3 best_match = target_hsv; // Fallback to original if nothing matches
-
-    for (uint i = 0; i < PALETTE_SIZE; i++) {
-        float3 p_hsv = palettes[i];
-
-        // 1. Hue Diff (Circular)
-        float h_diff = abs(target_hsv.x - p_hsv.x);
-        h_diff = min(h_diff, 1.0 - h_diff);
-
-        // 2. Sat/Val Diff
-        float s_diff = target_hsv.y - p_hsv.y;
-        float v_diff = target_hsv.z - p_hsv.z;
-
-        // 3. Calculate Weighted Distance
-        float d_sq = (h_diff * h_diff * WEIGHTS.x) + 
-                     (s_diff * s_diff * WEIGHTS.y) + 
-                     (v_diff * v_diff * WEIGHTS.z);
-
-        // 4. BLACKGUARD: Extra penalty for picking Black (V near 0) 
-        // if our target is actually bright (V > 0.2).
-        // This stops "Lazy Black" matching.
-        if (p_hsv.z < 0.2 && target_hsv.z > 0.2) {
-             d_sq += 100.0; // Massive penalty
-        }
-
-        if (d_sq < min_dist_sq) {
-            min_dist_sq = d_sq;
-            best_match = p_hsv;
-        }
-    }
-    
-    if (any(normal != float3(0.0))) {
-        // 2. Calculate Lighting
-        float3 light_dir = normalize(float3(2.0, 1.5, 10.0));    
-        float diffuse = max(0.2, dot(light_dir, normal));        
-        best_match.z *= diffuse;
-    }
-    return float4(hsv2rgb(best_match), 1.0);// Simple struct for bounding box intersection return
-}
 struct IntersectionResult {
     bool accept [[accept_intersection]];
     bool continueSearch [[continue_search]];

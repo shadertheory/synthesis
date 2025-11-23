@@ -1,4 +1,5 @@
 use core::slice;
+use derive_more::{Debug, *};
 use objc2::{rc::*, runtime::*, *};
 use objc2_av_foundation::*;
 use objc2_avf_audio::*;
@@ -12,7 +13,7 @@ use objc2_quartz_core::*;
 use objc2_ui_kit::*;
 use std::{
     f32::consts::PI,
-    ops::{Deref, DerefMut},
+    ops::{Deref, DerefMut, Div},
     ptr::{self, NonNull},
     sync::{Arc, Mutex},
     time::Duration,
@@ -35,27 +36,65 @@ use std::mem;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+pub struct Decibels {
+    db: f32,
+    radius: f32,
+}
+
+impl Decibels {
+    fn new(db: f32) -> Self {
+        Self {
+            db,
+            radius: Self::compute_radius(db),
+        }
+    }
+
+    fn compute_radius(volume: f32) -> f32 {
+        1.0
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 pub struct Source {
     id: u32,
     position: Vector<3, f32>,
-    volume: f32,
+    volume: Decibels,
     occlusion: f32,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Listener {
-    position: Vector<3, f32>,
-    orientation: Quaternion<f32>,
+    transform: Matrix<4, 4, f32>,
+    probe_count: usize,
 }
-
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Sum, Add, Clone, Copy, Default)]
 pub struct Probe {
     pub outdoor: f32,
     pub delay: f32,
     pub decay: f32,
     pub ambient: Vector<3, f32>,
+}
+
+impl Div<f32> for Probe {
+    type Output = Self;
+
+    fn div(self, rhs: f32) -> <Self as Div<f32>>::Output {
+        let Self {
+            outdoor,
+            delay,
+            decay,
+            ambient,
+        } = self;
+        Self {
+            outdoor: outdoor / rhs,
+            delay: delay / rhs,
+            decay: decay / rhs,
+            ambient: ambient / rhs,
+        }
+    }
 }
 
 #[repr(C)]
@@ -95,7 +134,9 @@ impl Acoustics {
         let make_pipeline = |func: &str| {
             let desc = MTLComputePipelineDescriptor::new();
             let name = NSString::from_str(func);
-            let function = library.newFunctionWithName(&name).unwrap();
+            let function = library
+                .newFunctionWithName(&name)
+                .expect(&format!("Could not load {name}"));
             desc.setComputeFunction(Some(&function));
             device
                 .newComputePipelineStateWithDescriptor_options_reflection_error(
@@ -117,9 +158,9 @@ impl Acoustics {
         let visualizer = make_pipeline("visualize");
 
         let listener_data = vec![make_buf(mem::size_of::<Listener>()); in_flight];
-        let source_data = vec![make_buf(max_sources * mem::size_of::<Source>()), in_flight];
-        let probe_data = vec![make_buf(max_probes * mem::size_of::<Probe>()), in_flight];
-        let visualization_data = vec![make_buf(max_dots * mem::size_of::<Visualizer>()), in_flight];
+        let source_data = vec![make_buf(max_sources * mem::size_of::<Source>()); in_flight];
+        let probe_data = vec![make_buf(max_probes * mem::size_of::<Probe>()); in_flight];
+        let visualization_data = vec![make_buf(max_dots * mem::size_of::<Visualizer>()); in_flight];
 
         Self {
             scan,
@@ -136,42 +177,65 @@ impl Acoustics {
     }
 
     pub unsafe fn dispatch(&mut self, cmd: &CommandBufferProtocol, residency: &ResidencyProtocol) {
+        let Some(listener) = self.listener else {
+            return;
+        };
         let enc = cmd.computeCommandEncoder().unwrap();
 
         enc.setComputePipelineState(&self.scan);
-        let one = MTLSize {
-            width: 1,
-            height: 1,
-            depth: 1,
-        };
-        enc.dispatchThreads_threadsPerThreadgroup(one, one);
+        enc.dispatchThreads_threadsPerThreadgroup(
+            MTLSize {
+                width: listener.probe_count,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+        );
 
         enc.setComputePipelineState(&self.occlusion);
-        enc.dispatchThreads_threadsPerThreadgroup(MTLSize, threads_per_threadgroup);
+        enc.dispatchThreads_threadsPerThreadgroup(
+            MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: self.sources.len(),
+                height: 1,
+                depth: 1,
+            },
+        );
     }
 
     pub unsafe fn readback(&mut self, ring: usize) {
         let probe_data = &mut self.probe_data[ring];
         let source_data = &mut self.source_data[ring];
 
-        let probe_count = *probe_data.contents().cast::<u32>();
+        let probe_count = *probe_data.contents().cast::<u32>().as_ptr();
         let probe_ptr = probe_data
             .contents()
             .byte_add(mem::size_of::<u32>())
-            .cast::<probe>();
-        let probe = (0..probe_count).map(|x| probe_ptr[x]).sum() / probe_count;
+            .cast::<Probe>()
+            .as_ptr();
+        self.probe = (0..probe_count)
+            .map(|x| probe_ptr.add(x as _).read())
+            .sum::<Probe>()
+            / (probe_count as f32);
 
-        self.probe(probe);
-
-        let source_count = *source_data.contents().cast::<u32>();
+        let source_count = *source_data.contents().cast::<u32>().as_ptr() as _;
         let source_ptr = source_data
             .contents()
             .byte_add(mem::size_of::<u32>())
-            .cast::<Source>();
+            .cast::<Source>()
+            .as_ptr();
         let sources = slice::from_raw_parts::<Source>(source_ptr, source_count);
 
         for gpu in sources {
-            let Ok(cpu_idx) = self.sources.binary_search_by_key(gpu.id, |src| src.id) else {
+            let Ok(cpu_idx) = self.sources.binary_search_by_key(&gpu.id, |src| src.id) else {
                 continue;
             };
 
@@ -187,10 +251,14 @@ impl Acoustics {
         let listener_data = &mut self.listener_data[ring];
         let source_data = &mut self.source_data[ring];
 
-        ptr::copy_nonoverlapping(&self.listener, &mut *listener_data.contents().cast(), 1);
+        ptr::copy_nonoverlapping(
+            &self.listener,
+            &mut *listener_data.contents().cast().as_ptr(),
+            1,
+        );
         ptr::copy_nonoverlapping(
             self.sources.as_ptr(),
-            &mut *source_data.contents().cast(),
+            &mut *source_data.contents().cast().as_ptr(),
             source_count,
         );
 
@@ -212,11 +280,6 @@ impl Acoustics {
         if self.upload(idx) {
             self.dispatch(cmd, residency);
         }
-        engine.apply(probe);
-    }
-
-    pub unsafe fn probe(&mut self, probe: Probe) {
-        self.probe = probe;
     }
 }
 pub trait Audio: Send + Sync {
@@ -315,7 +378,7 @@ impl Engine {
         let format = AVAudioFormat::initStandardFormatWithSampleRate_channels(
             AVAudioFormat::alloc(),
             output_format.sampleRate(),
-            2, tf
+            2,
         )
         .unwrap();
         driver.connect_to_format(&source_node, &output_node, Some(&format));
@@ -331,6 +394,10 @@ impl Engine {
             next: 0,
             sample_rate,
         })
+    }
+
+    fn apply(&self, probe: Probe) {
+        todo!()
     }
 }
 

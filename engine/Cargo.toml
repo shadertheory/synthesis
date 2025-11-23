@@ -25,6 +25,11 @@ objc2-game-controller = { version = "0.3.2", features=["GCController"]}
 objc2-av-foundation = "0.3.2"
 objc2-avf-audio = "0.3.2"
 objc2-core-audio-types = "0.3.2"
+derive_more = { version = "2.0.1", features = ["full"] }
+dispatch2 = "0.3.0"
+
+[build-dependencies]
+walkdir = "*"
 
 [profile.dev]
 panic = "abort"

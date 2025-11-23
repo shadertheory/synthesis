@@ -1,5 +1,6 @@
 use core::array;
 use core::slice;
+use std::env;
 use std::f32::EPSILON;
 use std::f32::consts::PI;
 use std::random;
@@ -10,6 +11,7 @@ use std::time::Duration;
 use std::{cell::RefCell, ptr::NonNull};
 use std::{mem, ptr, thread};
 
+use dispatch2::*;
 use noise::NoiseFn;
 use objc2::{rc::*, runtime::*, *};
 use objc2_core_graphics::*;
@@ -1258,6 +1260,8 @@ pub struct Metal {
     raytrace: Option<ComputePipelineProtocol>,
     intersect_table: Option<IntersectionFunctionTableProtocol>,
     acoustics: Acoustics,
+    engine: Engine,
+    synth: Arc<Synthesizer>,
 }
 
 impl Metal {
@@ -1274,26 +1278,6 @@ impl Metal {
         // 2. Register it with the engine (Engine holds one Arc)
         engine.add_source(synth.clone());
 
-        // 3. Sequencer Logic (Main Thread)
-        // We use the local Arc 'synth' to control the sound.
-        let env = Envelope {
-            attack: 0.01,
-            decay: 0.1,
-            sustain: 0.5,
-            release: 0.2,
-        };
-
-        synth.note_on(
-            Note::C.octave(5),
-            Waveform::Sine,
-            Envelope {
-                attack: 0.1,
-                decay: 0.5,
-                sustain: 0.3,
-                release: 0.2,
-            },
-        );
-        std::thread::sleep_ms(10000);
         let frame_in_flight = 3;
 
         let next_present = Some(next_present);
@@ -1311,13 +1295,10 @@ impl Metal {
             })
             .collect::<Vec<_>>();
 
-        let source = include_str!("ui3d.metal");
-
-        let source = NSString::from_str(source);
-
+        let library_data = include_bytes!(env!("METAL_SHADER_LIB_PATH"));
         let library = device
-            .newLibraryWithSource_options_error(&source, None)
-            .expect("Failed to compile shader");
+            .newLibraryWithData_error(&*DispatchData::from_bytes(library_data))
+            .unwrap();
 
         let shading = {
             let func_name = NSString::from_str("upscale_vert");
@@ -1566,7 +1547,7 @@ impl Metal {
 
         acceleration_structure.set_rebuild_callback(|accel| REBUILT = true);
 
-        let acoustics = unsafe { mem::zeroed() }; //::init(&device, &library);
+        let acoustics = unsafe { Acoustics::init(frame_in_flight, &device, &library) }; //::init(&device, &library);
 
         Self {
             frame: 0,
@@ -1592,6 +1573,8 @@ impl Metal {
             intersect_table: None,
             palette_buffer,
             acoustics,
+            engine,
+            synth,
         }
     }
 
@@ -1709,7 +1692,13 @@ impl Metal {
                 threads_per_threadgroup,
             );
         }
-        let probes = self.acoustics.probe(&self.device, &command_buffer);
+        self.acoustics.update(
+            self.frame,
+            self.frame_in_flight,
+            &self.engine,
+            &command_buffer,
+            &self.residency_set,
+        );
         encoder.barrierAfterStages_beforeQueueStages_visibilityOptions(
             MTLStages::All,
             MTLStages::Fragment,
