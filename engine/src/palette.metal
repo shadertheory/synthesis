@@ -7,7 +7,7 @@ constant float3 WEIGHTS = float3(40.0, 20.0, 10.0);
 
 float3 palettize(
 
-        constant float3* palettes,
+        constant packed_float3* palettes,
         float3 color) {
     float3 target_hsv = rgb2hsv(color);
     float min_dist_sq = 1e9; 

@@ -1,8 +1,20 @@
-use std::env;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::*;
 use std::process::Command;
-use walkdir::*;
+use std::{env, fs};
+
+fn visit(path: &Path, cb: &mut dyn FnMut(PathBuf)) -> io::Result<()> {
+    for e in fs::read_dir(path)? {
+        let e = e?;
+        let path = e.path();
+        if path.is_dir() {
+            visit(&path, cb)?;
+        } else if path.is_file() {
+            cb(path);
+        }
+    }
+    Ok(())
+}
 
 fn main() {
     let os = env::var("CARGO_CFG_TARGET_OS").expect("Must be built with cargo");
@@ -28,50 +40,46 @@ fn main() {
     println!("cargo::warning=Using Metal SDK: '{sdk}' for target: '{target}'");
 
     let mut files = vec![];
-    for entry in WalkDir::new(src.clone()) {
-        let Ok(entry) = entry else {
-            continue;
-        };
-
-        let path = entry.into_path();
-
+    visit(&src, &mut |path: PathBuf| {
         let Some(ext) = path.extension() else {
-            continue;
+            return;
         };
 
+        println!("cargo::warning={ext:?}");
         if ext != "metal" {
-            continue;
+            return;
         }
+
+        let Some(name) = path.file_name() else {
+            return;
+        };
 
         // Read the file content to check for shader entry points
         let mut content = String::new();
         let Ok(mut file) = std::fs::File::open(&path) else {
-            continue;
+            return;
         };
         if file.read_to_string(&mut content).is_err() {
-            continue;
+            return;
         }
-        let is_source_file = ["kernel", "vertex", "fragment"] 
+        let is_source_file = ["kernel", "vertex", "fragment"]
             .iter()
             .map(|x| format!("{x} "))
             .any(|x| content.contains(&x));
-        if !is_source_file 
-        {
-            println!(
-                "cargo::warning=Skipping header: {:?}",
-                path.file_name().unwrap()
-            );
-            continue;
+        if !is_source_file {
+            println!("cargo::warning=Skipping header: {:?}", name);
+            return;
         }
         files.push(path);
-    }
+    })
+    .expect("Failed to traverse");
     if files.len() == 0 {
         return;
     }
 
     let mut ir = vec![];
     for file in files {
-        let name = file.file_name().unwrap();
+        let name = file.file_name().expect("failed to get name");
 
         println!("cargo::warning=Compiling shader '{name:?}'");
 
@@ -85,10 +93,10 @@ fn main() {
             "metal",
             "-c",
             "-I",
-            src.as_os_str().to_str().unwrap(),
-            file.as_os_str().to_str().unwrap(),
+            src.as_os_str().to_str().expect("failed to get src"),
+            file.as_os_str().to_str().expect("failed to get file"),
             "-o",
-            out.as_os_str().to_str().unwrap(),
+            out.as_os_str().to_str().expect("failed to get out"),
         ];
         let compiler = Command::new("xcrun")
             .args(args)

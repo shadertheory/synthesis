@@ -10,9 +10,11 @@
     random
 )]
 
-mod acoustics;
-mod darwin;
-mod world;
+pub mod acoustics;
+pub mod darwin;
+pub mod dsp;
+pub mod world;
+pub use darwin::*;
 
 use math::*;
 use std::{

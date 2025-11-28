@@ -148,7 +148,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
-				CARGO_TARGET_DIR = "$(PROJECT_TEMP_DIR)/cargo_target";
+				CARGO_TARGET_DIR = "$(SRCROOT)/../target";
 				CARGO_XCODE_BUILD_PROFILE = release;
 				CARGO_XCODE_FEATURES = "";
 				CURRENT_PROJECT_VERSION = 0.1;
@@ -165,7 +165,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
-				CARGO_TARGET_DIR = "$(PROJECT_TEMP_DIR)/cargo_target";
+				CARGO_TARGET_DIR = "$(SRCROOT)/../target";
 				CARGO_XCODE_BUILD_PROFILE = debug;
 				CARGO_XCODE_FEATURES = "";
 				CURRENT_PROJECT_VERSION = 0.1;

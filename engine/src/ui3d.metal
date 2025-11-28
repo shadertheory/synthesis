@@ -23,14 +23,10 @@ typedef IntersectionResult IntersectionFunction(float3,
                                                      float3,
                                                      float,
                                                      float);
-// A payload structure to pass custom data from intersection functions.
-struct RayPayload {
-    float3 normal;
-};
 
 struct BoundingBox {
-    float3 min;
-    float3 max;
+    packed_float3 min;
+    packed_float3 max;
 };
 
 // Option 1: As a constant in your shader
@@ -101,7 +97,7 @@ IntersectionResult grid_intersect(
 
     if(invEdge > 0.95) {
         result.accept = true;
-        result.distance = maxDistance - 0.1;
+        result.distance = t;
         result.continueSearch = true;
     }
     return result;
