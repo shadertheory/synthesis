@@ -1,0 +1,72 @@
+
+let instance_buffer = self
+            .device
+            .newBufferWithLength_options(
+                std::mem::size_of::<MTLIndirectAccelerationStructureInstanceDescriptor>(),
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap();
+
+        let instance_count_buffer = self
+            .device
+            .newBufferWithLength_options(32, MTLResourceOptions::StorageModeShared)
+            .unwrap();
+
+        *instance_count_buffer.contents().cast::<u32>().as_mut() = 1;
+        let accel_desc = MTL4PrimitiveAccelerationStructureDescriptor::init(
+            MTL4PrimitiveAccelerationStructureDescriptor::alloc(),
+        );
+        let bounding_box_buffer = self
+            .device
+            .newBufferWithLength_options(32, MTLResourceOptions::StorageModeShared)
+            .unwrap();
+
+        let _: () = msg_send![&*self.residency_set, addAllocation: &*bounding_box_buffer];
+        #[repr(C)]
+        struct BoundingBox {
+            min: [f32; 3],
+            max: [f32; 3],
+        }
+
+        let bbox = BoundingBox {
+            min: [-0.5, -0.5, -0.5],
+            max: [0.5, 0.5, 0.5],
+        };
+        *bounding_box_buffer
+            .contents()
+            .cast::<BoundingBox>()
+            .as_mut() = bbox;
+
+        let geometry = MTL4AccelerationStructureBoundingBoxGeometryDescriptor::init(
+            MTL4AccelerationStructureBoundingBoxGeometryDescriptor::alloc(),
+        );
+        geometry.setBoundingBoxCount(1);
+        geometry.setBoundingBoxStride(24);
+        geometry.setBoundingBoxBuffer(MTL4BufferRange {
+            bufferAddress: bounding_box_buffer.gpuAddress(),
+            length: 32,
+        });
+        geometry.setIntersectionFunctionTableOffset(0);
+        geometry.setOpaque(false);
+        let geometry_array = NSArray::from_slice(&[&*geometry]);
+        let _: () = msg_send![&*accel_desc, setGeometryDescriptors:&*geometry_array];
+
+        let mut instance_desc = MTL4IndirectInstanceAccelerationStructureDescriptor::init(
+            MTL4IndirectInstanceAccelerationStructureDescriptor::alloc(),
+        );
+
+        instance_desc.setMaxInstanceCount(1);
+        instance_desc.setInstanceDescriptorStride(mem::size_of::<
+            MTLIndirectAccelerationStructureInstanceDescriptor,
+        >());
+        instance_desc.setInstanceCountBuffer(MTL4BufferRange {
+            bufferAddress: instance_count_buffer.gpuAddress(),
+            length: 32,
+        });
+        instance_desc.setInstanceDescriptorBuffer(MTL4BufferRange {
+            bufferAddress: instance_buffer.gpuAddress(),
+            length: mem::size_of::<MTLIndirectAccelerationStructureInstanceDescriptor>() as _,
+        });
+        instance_desc
+            .setInstanceDescriptorType(MTLAccelerationStructureInstanceDescriptorType::Indirect);
+
