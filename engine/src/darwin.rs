@@ -1,14 +1,17 @@
 use core::array;
 use core::slice;
+use std::env;
 use std::f32::EPSILON;
 use std::f32::consts::PI;
 use std::random;
 use std::random::DefaultRandomSource;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 use std::{cell::RefCell, ptr::NonNull};
 use std::{mem, ptr, thread};
 
+use dispatch2::*;
 use noise::NoiseFn;
 use objc2::{rc::*, runtime::*, *};
 use objc2_core_graphics::*;
@@ -20,6 +23,7 @@ use objc2_quartz_core::*;
 use objc2_ui_kit::*;
 use rand::Rng;
 
+use crate::acoustics::*;
 use crate::darwin::rtx::{BoundingBox, GeometryDescriptor, InstanceDescriptor};
 use math::*;
 
@@ -944,19 +948,18 @@ mod rtx {
                     MTLAccelerationStructureInstanceDescriptorType::Indirect,
                 );
             }
+
             unsafe {
-                // CRITICAL: Ensure all buffers are in the residency set and committed
                 let _: () = msg_send![&*self.residency, addAllocation: &*self.bbox];
                 let _: () = msg_send![&*self.residency, addAllocation: &*self.instance_indirect];
                 let _: () = msg_send![&*self.residency, addAllocation: &*self.instance_count];
                 let _: () = msg_send![&*self.residency, addAllocation: &*self.per_instance_data];
                 let _: () = msg_send![&*self.residency, addAllocation: &*self.scratch];
-
-                self.residency.commit();
-                self.residency.requestResidency();
-
-                // Use the residency set AFTER committing and requesting residency
-                cmd.useResidencySet(&self.residency);
+                for (_, data) in self.geometry.iter() {
+                    if let Some(primitive) = &data.primitive {
+                        let _: () = msg_send![&*self.residency, addAllocation: &**primitive];
+                    }
+                }
             }
             let structure = unsafe { self.build_acceleration_structure(&cmd, &descriptor) };
             self.structure = Some(structure);
@@ -1005,7 +1008,6 @@ mod rtx {
                 }
 
                 unsafe {
-                    // CRITICAL: Ensure all buffers are in the residency set and committed
                     let _: () = msg_send![&*self.residency, addAllocation: &*self.bbox];
                     let _: () =
                         msg_send![&*self.residency, addAllocation: &*self.instance_indirect];
@@ -1013,12 +1015,6 @@ mod rtx {
                     let _: () =
                         msg_send![&*self.residency, addAllocation: &*self.per_instance_data];
                     let _: () = msg_send![&*self.residency, addAllocation: &*self.scratch];
-
-                    self.residency.commit();
-                    self.residency.requestResidency();
-
-                    // Use the residency set AFTER committing and requesting residency
-                    cmd.useResidencySet(&self.residency);
                 }
                 let acceleration_structure =
                     unsafe { self.build_acceleration_structure(&cmd, &primitive_descriptor) };
@@ -1255,6 +1251,11 @@ pub struct Metal {
     acceleration_structure: rtx::AccelerationStructure,
     raytrace: Option<ComputePipelineProtocol>,
     intersect_table: Option<IntersectionFunctionTableProtocol>,
+    acoustics: Acoustics,
+    engine: Engine,
+    synth: Arc<Synthesizer>,
+    spatial_synth: Arc<SpatialAudioProcessor>,
+    synth_id: u64,
 }
 
 impl Metal {
@@ -1263,6 +1264,27 @@ impl Metal {
         next_texture: Box<dyn Fn() -> (TextureProtocol, Size)>,
         next_present: Box<dyn Fn(&mut Metal)>,
     ) -> Self {
+        let mut engine = Engine::init().unwrap();
+
+        // 1. Create the synth
+        let synth = Arc::new(Synthesizer::new());
+        // 2. Create Spatial Audio Wrapper
+        let spatial_synth = Arc::new(SpatialAudioProcessor::new(synth.clone()));
+
+        // 3. Register wrapper with the engine
+        let synth_id = engine.add_source(spatial_synth.clone());
+
+        synth.note_on(
+            Frequency::from_hz(440.0),
+            Waveform::Saw,
+            Envelope {
+                attack: 0.1,
+                decay: 0.1,
+                sustain: 1.0,
+                release: 0.1,
+            },
+        );
+
         let frame_in_flight = 3;
 
         let next_present = Some(next_present);
@@ -1280,13 +1302,10 @@ impl Metal {
             })
             .collect::<Vec<_>>();
 
-        let source = include_str!("ui3d.metal");
-
-        let source = NSString::from_str(source);
-
+        let library_data = include_bytes!(env!("METAL_SHADER_LIB_PATH"));
         let library = device
-            .newLibraryWithSource_options_error(&source, None)
-            .expect("Failed to compile shader");
+            .newLibraryWithData_error(&*DispatchData::from_bytes(library_data))
+            .unwrap();
 
         let shading = {
             let func_name = NSString::from_str("upscale_vert");
@@ -1385,6 +1404,9 @@ impl Metal {
         for hex in PALETTE.lines() {
             palette_data.push(dbg!(rgb_to_hsv(hex_to_rgb(hex).unwrap())));
         }
+        for _ in 0..64 {
+            palette_data.push(Vector([0.0, 0.0, 0.0]));
+        }
         let mut palette_data_slice = unsafe {
             slice::from_raw_parts_mut(
                 palette_data.as_mut_ptr().cast::<u8>(),
@@ -1437,6 +1459,7 @@ impl Metal {
         let residency_set = device
             .newResidencySetWithDescriptor_error(&residency_desc)
             .unwrap();
+        let _: () = msg_send![&*residency_set, addAllocation: &*palette_buffer];
 
         for i in 0..frame_in_flight {
             let _: () = msg_send![&*residency_set, addAllocation: &*render_texture[i]];
@@ -1448,7 +1471,7 @@ impl Metal {
         let argument_table_descriptor =
             MTL4ArgumentTableDescriptor::init(MTL4ArgumentTableDescriptor::alloc());
         argument_table_descriptor.setMaxTextureBindCount(4);
-        argument_table_descriptor.setMaxBufferBindCount(4);
+        argument_table_descriptor.setMaxBufferBindCount(24);
 
         let argument_table2 = (0..frame_in_flight)
             .map(|_| {
@@ -1535,6 +1558,15 @@ impl Metal {
 
         acceleration_structure.set_rebuild_callback(|accel| REBUILT = true);
 
+        let mut acoustics = unsafe { Acoustics::init(frame_in_flight, &device, &library) };
+        let source_pos = Vector([4.0, 4.0, 7.0]);
+        acoustics.add_source(synth_id as u32, source_pos);
+        unsafe {
+            acoustics.add_to_residency(&residency_set);
+            residency_set.commit();
+            residency_set.requestResidency();
+        }
+
         Self {
             frame: 0,
             frame_in_flight,
@@ -1558,20 +1590,44 @@ impl Metal {
             raytrace: None,
             intersect_table: None,
             palette_buffer,
+            acoustics,
+            engine,
+            synth,
+            spatial_synth,
+            synth_id,
         }
     }
 
     unsafe fn render(&mut self, camera: CameraData) {
-        if self.frame >= self.frame_in_flight {
-            let frame_to_wait = self.frame - self.frame_in_flight;
-            let done: bool = msg_send![&self.frame_event, waitUntilSignaledValue:frame_to_wait, timeoutMS:10usize];
+        let frame = self.frame;
+        let frame_index = frame % self.frame_in_flight;
+        if frame >= self.frame_in_flight {
+            let frame_to_wait = frame - self.frame_in_flight;
+            let done: bool = msg_send![&self.frame_event, waitUntilSignaledValue:frame_to_wait, timeoutMS:16usize];
+            if done {
+                self.frame += 1;
+            } else {
+                println!("GPU Sync Timeout!");
+                return;
+            }
         }
-
-        let frame_index = self.frame % self.frame_in_flight;
-        self.frame += 1;
 
         let (id, size) = (self.next_texture)();
 
+        // Update acoustics
+        self.acoustics.update_listener(camera.transform);
+
+        let (mut occlusion, hits) = unsafe { self.acoustics.readback_results(frame_index) };
+
+        if occlusion.is_nan() || occlusion < 0.0 || occlusion > 1.0 {
+            occlusion = occlusion.clamp(0.0, 1.0);
+        }
+
+        let source_volume = self.acoustics.get_source_volume(self.synth_id as u32);
+        // Update Spatial Synth with current positions and volume
+        let source_pos = Vector([4.0, 4.0, 7.0]);
+        self.spatial_synth
+            .update(camera.transform, source_pos, source_volume, occlusion, hits);
         let command_buffer = self.device.newCommandBuffer().unwrap();
         self.command_allocator[frame_index].reset();
 
@@ -1646,6 +1702,8 @@ impl Metal {
             self.argument_table[frame_index]
                 .setResource_atBufferIndex(intersect_table.gpuResourceID(), 2);
             let _: () = msg_send![&*self.residency_set, addAllocation: &**intersect_table];
+            self.residency_set.commit();
+            command_buffer.useResidencySet(&self.residency_set);
         }
 
         *self.camera_buffer[frame_index]
@@ -1653,6 +1711,15 @@ impl Metal {
             .cast::<CameraData>()
             .as_mut() = camera;
 
+        if self.intersect_table.is_some() && self.acceleration_structure.protocol().is_some() {
+            self.acoustics.update(
+                frame,
+                self.frame_in_flight,
+                &self.engine,
+                &command_buffer,
+                &self.argument_table[frame_index],
+            );
+        }
         let encoder = command_buffer
             .computeCommandEncoder()
             .expect("failed to make compute encoder");
@@ -1677,11 +1744,22 @@ impl Metal {
         }
         encoder.barrierAfterStages_beforeQueueStages_visibilityOptions(
             MTLStages::All,
-            MTLStages::Fragment,
+            MTLStages::Dispatch,
             MTL4VisibilityOptions::Device,
         );
 
         encoder.endEncoding();
+
+        /*
+        if let Some(diff) = self.acoustics.get_diffraction(self.synth_id as u32) {
+            let world_dir = diff.direction;
+            let view_dir_4 = camera.view * world_dir.expand(0.0);
+            let local_dir = Vector([view_dir_4[0], view_dir_4[1], view_dir_4[2]]);
+            self.synth.set_direction(local_dir);
+        } else {
+            println!("No diffraction for source {}", self.synth_id);
+        }
+        */
 
         self.argument_table2[frame_index]
             .setTexture_atIndex(self.world_position_texture[frame_index].gpuResourceID(), 2);
@@ -1706,6 +1784,12 @@ impl Metal {
         let render_encoder = command_buffer
             .renderCommandEncoderWithDescriptor(&render_descriptor)
             .unwrap();
+
+        render_encoder.barrierAfterQueueStages_beforeStages_visibilityOptions(
+            MTLStages::all(),
+            MTLStages::Fragment,
+            MTL4VisibilityOptions::Device,
+        );
 
         render_encoder.setArgumentTable_atStages(
             &self.argument_table2[frame_index],

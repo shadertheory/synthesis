@@ -9,7 +9,7 @@
     type_alias_impl_trait
 )]
 
-use derive_more::{Deref, DerefMut};
+use derive_more::{Debug, *};
 use std::{
     cell::RefCell,
     convert::identity,
@@ -444,6 +444,13 @@ impl Projection {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Vector<const DIM: usize, T>(pub [T; DIM]);
+
+impl<const DIM: usize, T: Num> Sum for Vector<DIM, T> {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.into_iter()
+            .fold(Vector::<DIM, T>::ZERO, Vector::<DIM, T>::add)
+    }
+}
 
 impl<const DIM: usize, T> Vector<DIM, T> {
     pub fn expand(self, component: T) -> Vector<{ DIM + 1 }, T> {
