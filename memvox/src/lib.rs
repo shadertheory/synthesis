@@ -422,8 +422,7 @@ impl<T: PartialEq + Clone + std::fmt::Debug> BoundingBox<T> {
                 size_x += 1;
             }
 
-            println!("Found Size: {:?}", [size_x,size_y,size_z]);
-
+            println!("Found Size: {:?}", [size_x, size_y, size_z]);
 
             // Mark visited
             for z in 0..size_z {
