@@ -1,0 +1,3 @@
+remote_path = "solmidnight@rog-ally-wsl:/mnt/z/synthesis"
+
+ignorefile_paths = [".gitignore"]
